@@ -123,7 +123,7 @@ class Engineering:
                 else:
                     # 如果所有车辆都在使用，强制使用循环编号（允许重复）
                     vehicle_id = ((self.max_vehicle_id - 1) % max_vehicles) + 1
-                    print(f"警告：车辆资源不足，重复使用车辆编号 {vehicle_id}")
+                    # print(f"警告：车辆资源不足，重复使用车辆编号 {vehicle_id}")
             else:
                 vehicle_id = self.max_vehicle_id
         
@@ -3068,7 +3068,7 @@ class Engineering:
         self.load_routes_3_dim(phase_res)#将结果加载到rl中，方便后续的时刻表文件生成
         self.connect()
 
-        return 
+        # return 
         ######### 基于规则生成运行图的部分完毕############
 
         params = self.initialize_params()# 把这套代码的输入全部整到params里面
@@ -4676,7 +4676,7 @@ class Engineering:
                             window_stat[i] = rss[0]
                         else:
                             # 连接Connect
-                            print(f"入库的rss.size ={len(rss)} ")
+                            # print(f"入库的rss.size ={len(rss)} ")
                             rs_ptr = window_stat[i]
                             for r_idx in range(1, len(rss)):
                                 rs_ptr.next_ptr = rss[r_idx]
@@ -4727,7 +4727,7 @@ class Engineering:
                             window_stat[i] = rss[0]
                         else:
                             # 连接Connect
-                            print(f"出库的rss.size ={len(rss)} ")
+                            # print(f"出库的rss.size ={len(rss)} ")
                             rs_ptr = rss[1]
                             to_add.append(rs_ptr)
                             for r_idx in range(2, len(rss)):

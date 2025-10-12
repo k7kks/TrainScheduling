@@ -874,8 +874,8 @@ class TrainScheduler:
             if b == 1:
                 r2 = self.get_travel_time(self.params.jiaolu_end[0], self.params.jiaolu_end[1]) + self.get_stop_time(
                     self.params.jiaolu_end[0] - 1, self.params.jiaolu_end[1])
-            print(f"r1 = {r1}")
-            print(f"r2 = {r2}")
+            # print(f"r1 = {r1}")
+            # print(f"r2 = {r2}")
             # 构建约束
             idx_a = self.get_idx(a, c1)
             idx_b = self.get_idx(b, c2)
