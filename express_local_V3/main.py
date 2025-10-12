@@ -43,6 +43,7 @@ from Route import Route
 from algorithms.express_local_generator import ExpressLocalGenerator, ExpressLocalConfig
 from algorithms.timetable_builder import TimetableBuilder
 from algorithms.headway_optimizer import HeadwayOptimizer  # 发车间隔优化器
+from algorithms.connection_manager import ConnectionManager  # 车次勾连管理器
 from models.express_local_timetable import ExpressLocalTimetable
 from models.train import Train, ExpressTrain, LocalTrain
 from models.timetable_entry import TimetableEntry
@@ -108,6 +109,7 @@ class ExpressLocalSchedulerV3:
         self.generator: ExpressLocalGenerator = None
         self.builder: TimetableBuilder = None
         self.optimizer: HeadwayOptimizer = None  # 发车间隔优化器
+        self.connection_manager: ConnectionManager = None  # 车次勾连管理器
         
         # 车次计数器
         self.table_num_counter = 1
@@ -187,6 +189,12 @@ class ExpressLocalSchedulerV3:
                 min_headway=config.min_headway,
                 max_headway=config.max_headway,
                 time_window=60  # 允许±60秒的调整范围
+            )
+            
+            # 创建车次勾连管理器
+            self.connection_manager = ConnectionManager(
+                rail_info=self.rail_info,
+                debug=self.debug
             )
             
             print(f"[OK] 算法模块初始化完成")
@@ -373,17 +381,26 @@ class ExpressLocalSchedulerV3:
         
         这是连接优化算法和src输出接口的关键转换层
         
+        主要步骤：
+        1. 转换所有列车为RouteSolution对象
+        2. 建立车次勾连关系（快车连快车，慢车连慢车）
+        3. 分配表号
+        
         Returns:
             Solution对象
         """
         try:
             solution = Solution(self.debug)
+            route_solutions = []
             
             # 获取第一个峰期作为参考
             peak = self.user_setting.peaks[0]
             
-            # 转换所有列车
+            # 步骤1：转换所有列车为RouteSolution对象
             all_trains = self.timetable.express_trains + self.timetable.local_trains
+            
+            if self.debug:
+                print(f"\n[转换] 开始转换 {len(all_trains)} 个列车...")
             
             for train in all_trains:
                 # 根据列车属性获取正确的路径ID
@@ -405,7 +422,20 @@ class ExpressLocalSchedulerV3:
                 rs = self._create_route_solution_from_path(train, route_id, path)
                 
                 if rs:
-                    solution.addTrainService(rs)
+                    route_solutions.append(rs)
+            
+            if self.debug:
+                print(f"[转换] 成功转换 {len(route_solutions)} 个列车")
+            
+            # 步骤2：建立车次勾连关系
+            if self.debug:
+                print(f"\n[勾连] 开始建立车次勾连...")
+            
+            route_solutions = self.connection_manager.connect_all_trains(route_solutions)
+            
+            # 步骤3：添加到Solution对象
+            for rs in route_solutions:
+                solution.addTrainService(rs)
             
             return solution
             
