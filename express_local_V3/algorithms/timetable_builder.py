@@ -38,19 +38,31 @@ class TimetableBuilder:
     时刻表构建器
     
     根据列车和线路信息，构建详细的时刻表
+    支持快车越行慢车的检测和处理
     """
     
-    def __init__(self, rail_info: RailInfo):
+    def __init__(self, rail_info: RailInfo, enable_overtaking: bool = True):
         """
         初始化构建器
         
         Args:
             rail_info: 线路信息
+            enable_overtaking: 是否启用越行处理（默认True）
         """
         self.rail_info = rail_info
+        self.enable_overtaking = enable_overtaking
         
         # 获取车站列表（按线路顺序）
         self.stations = self._get_ordered_stations()
+        
+        # 越行参数（严格按照md文档）
+        self.min_tracking_interval = 120      # 最小追踪间隔（秒）
+        self.min_arrival_pass_interval = 120  # 最小到通间隔（秒）
+        self.min_pass_departure_interval = 120  # 最小通发间隔（秒）
+        self.min_overtaking_dwell = 240       # 越行站最小停站时间（秒，4分钟）
+        
+        # 可越行的车站索引（每隔2站可以越行）
+        self.overtaking_station_indices = set(range(2, len(self.stations), 2))
     
     def _get_ordered_stations(self) -> List[Station]:
         """获取按线路顺序排列的车站列表"""
@@ -79,6 +91,12 @@ class TimetableBuilder:
         
         # 重建索引
         timetable._rebuild_indexes()
+        
+        # 【关键】如果启用越行处理，检测并处理越行
+        if self.enable_overtaking:
+            print("\n[越行] 开始检测快车越行慢车...")
+            overtaking_count = self._detect_and_handle_overtaking(timetable)
+            print(f"[越行] 检测完成，共处理 {overtaking_count} 次越行事件")
         
         return timetable
     
@@ -306,4 +324,179 @@ class TimetableBuilder:
         # 如果车站没有站台，返回车站ID作为后备
         print(f"[WARNING] 车站{station.name}没有找到合适的站台，使用车站ID")
         return station.id
+    
+    def _detect_and_handle_overtaking(self, timetable: ExpressLocalTimetable) -> int:
+        """
+        检测并处理快车越行慢车
+        
+        这是从overtaking_demo.py验证过的核心算法
+        
+        Args:
+            timetable: 时刻表
+            
+        Returns:
+            处理的越行事件数量
+        """
+        overtaking_count = 0
+        
+        # 按方向分组处理
+        for direction in ['上行', '下行']:
+            # 获取该方向的快车和慢车
+            express_trains = [t for t in timetable.express_trains if t.direction == direction]
+            local_trains = [t for t in timetable.local_trains if t.direction == direction]
+            
+            # 检测每对快慢车
+            for express in express_trains:
+                for local in local_trains:
+                    if self._check_and_handle_single_overtaking(express, local, timetable):
+                        overtaking_count += 1
+        
+        return overtaking_count
+    
+    def _check_and_handle_single_overtaking(self,
+                                           express: ExpressTrain,
+                                           local: LocalTrain,
+                                           timetable: ExpressLocalTimetable) -> bool:
+        """
+        检查并处理单个快慢车对的越行
+        
+        Args:
+            express: 快车
+            local: 慢车
+            timetable: 时刻表
+            
+        Returns:
+            是否发生了越行
+        """
+        # 前提：快车在慢车后面出发
+        if express.departure_time <= local.departure_time:
+            return False
+        
+        # 获取时刻表条目
+        local_entries = timetable.get_train_schedule(local.train_id)
+        express_entries = timetable.get_train_schedule(express.train_id)
+        
+        if not local_entries or not express_entries:
+            return False
+        
+        # 查找越行点
+        overtaking_station_idx = self._find_overtaking_point(local_entries, express_entries)
+        
+        if overtaking_station_idx is not None:
+            # 应用越行处理
+            self._apply_overtaking(local_entries, express_entries, overtaking_station_idx, local, express)
+            
+            print(f"  [越行] {express.train_name} 在站点{overtaking_station_idx+1} 越行 {local.train_name}")
+            return True
+        
+        return False
+    
+    def _find_overtaking_point(self,
+                               local_entries: List[TimetableEntry],
+                               express_entries: List[TimetableEntry]) -> Optional[int]:
+        """
+        找到越行发生的位置
+        
+        Args:
+            local_entries: 慢车时刻表条目
+            express_entries: 快车时刻表条目
+            
+        Returns:
+            越行站索引（在local_entries中的索引），如果不会越行则返回None
+        """
+        # 逐站检查
+        for i, local_entry in enumerate(local_entries):
+            # 查找快车在该站的条目
+            express_entry = None
+            for e in express_entries:
+                if e.station_id == local_entry.station_id:
+                    express_entry = e
+                    break
+            
+            if express_entry is None:
+                continue
+            
+            # 检查是否会发生追踪间隔冲突
+            # 条件：快车到达时间 < 慢车离站时间 + 最小追踪间隔
+            if express_entry.arrival_time < local_entry.departure_time + self.min_tracking_interval:
+                # 会发生冲突，从当前站往前找最近的越行站
+                for j in range(i, -1, -1):
+                    if j in self.overtaking_station_indices:
+                        return j
+                
+                # 如果没有找到越行站，使用当前站
+                return i
+        
+        return None
+    
+    def _apply_overtaking(self,
+                         local_entries: List[TimetableEntry],
+                         express_entries: List[TimetableEntry],
+                         overtaking_station_idx: int,
+                         local_train: LocalTrain,
+                         express_train: ExpressTrain):
+        """
+        应用越行处理（从overtaking_demo.py移植的核心算法）
+        
+        处理步骤：
+        1. 计算慢车需要的停站时间
+        2. 确保满足到通间隔≥120秒
+        3. 确保满足通发间隔≥120秒
+        4. 确保停站时间≥240秒（4分钟）
+        5. 顺延后续所有站点的时刻
+        
+        Args:
+            local_entries: 慢车时刻表条目
+            express_entries: 快车时刻表条目
+            overtaking_station_idx: 越行站索引
+            local_train: 慢车对象
+            express_train: 快车对象
+        """
+        # 获取越行站的条目
+        local_entry = local_entries[overtaking_station_idx]
+        
+        # 查找快车在越行站的条目
+        express_entry = None
+        for e in express_entries:
+            if e.station_id == local_entry.station_id:
+                express_entry = e
+                break
+        
+        if express_entry is None:
+            return
+        
+        # 保存原始发车时间（用于计算顺延量）
+        original_departure = local_entry.departure_time
+        
+        # 快车通过时间
+        express_pass_time = express_entry.arrival_time
+        
+        # 计算到通间隔
+        arrival_to_pass = express_pass_time - local_entry.arrival_time
+        
+        # 慢车发车时间 = 快车通过时间 + 通发间隔
+        new_local_departure = express_pass_time + self.min_pass_departure_interval
+        
+        # 慢车停站时间
+        new_dwell_time = new_local_departure - local_entry.arrival_time
+        
+        # 确保停站时间至少240秒（4分钟）
+        if new_dwell_time < self.min_overtaking_dwell:
+            new_dwell_time = self.min_overtaking_dwell
+            new_local_departure = local_entry.arrival_time + new_dwell_time
+        
+        # 计算时间顺延量
+        time_shift = new_local_departure - original_departure
+        
+        # 应用越行站的时间调整
+        local_entry.departure_time = new_local_departure
+        local_entry.dwell_time = new_dwell_time
+        local_entry.is_overtaking = True
+        local_entry.overtaken_by = express_train.train_id
+        local_entry.waiting_time = time_shift
+        
+        # 顺延后续所有站点的时间
+        for i in range(overtaking_station_idx + 1, len(local_entries)):
+            local_entries[i].arrival_time += time_shift
+            local_entries[i].departure_time += time_shift
 

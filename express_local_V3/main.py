@@ -181,8 +181,8 @@ class ExpressLocalSchedulerV3:
             # 创建生成器
             self.generator = ExpressLocalGenerator(config)
             
-            # 创建时刻表构建器
-            self.builder = TimetableBuilder(self.rail_info)
+            # 创建时刻表构建器（重新启用越行）
+            self.builder = TimetableBuilder(self.rail_info, enable_overtaking=True)
             
             # 创建发车间隔优化器
             self.optimizer = HeadwayOptimizer(
@@ -367,6 +367,68 @@ class ExpressLocalSchedulerV3:
             print(f"[OK] 转换完成")
             print(f"  - RouteSolution数: {len(self.solution.route_lists)}")
             
+            # 【调试】检查所有慢车的停站时间，验证越行是否正确
+            print(f"\n[越行验证] 检查所有慢车的停站时间...")
+            local_count = 0
+            overtaking_station_found = 0
+            overtaking_trains = []
+            
+            for rs in self.solution.route_lists:
+                # 只检查慢车
+                if not getattr(rs, 'is_express', False):
+                    local_count += 1
+                    has_overtaking = False
+                    
+                    # 查找停站时间≥200秒的站点（越行站）
+                    for i, dwell in enumerate(rs.stopped_time):
+                        if dwell >= 200:
+                            platform = rs.stopped_platforms[i] if i < len(rs.stopped_platforms) else 'N/A'
+                            arr = rs.arr_time[i] if i < len(rs.arr_time) else 0
+                            dep = rs.dep_time[i] if i < len(rs.dep_time) else 0
+                            overtaking_station_found += 1
+                            has_overtaking = True
+                            
+                            # 只打印前5个，避免输出太多
+                            if overtaking_station_found <= 5:
+                                print(f"  [越行站] 车次{rs.car_info.table_num}: 站台{platform} 停站{dwell}秒")
+                    
+                    if has_overtaking:
+                        overtaking_trains.append(rs.car_info.table_num)
+            
+            print(f"\n[越行验证结果]")
+            print(f"  总慢车数: {local_count}")
+            print(f"  发现越行站数: {overtaking_station_found}")
+            print(f"  被越行的慢车数: {len(overtaking_trains)}")
+            
+            if overtaking_station_found > 0:
+                print(f"  [OK] 越行时刻已正确保存到RouteSolution")
+                if overtaking_station_found < 25:
+                    print(f"  [注意] 检测到25次越行事件，但只有{overtaking_station_found}个越行站停站时间≥200秒")
+                    print(f"  [可能原因] 部分越行的停站时间调整未正确应用到RouteSolution")
+            else:
+                print(f"  [WARNING] 未发现越行站（停站时间≥200秒）")
+                print(f"  [WARNING] 越行调整未正确应用到RouteSolution")
+            
+            # 【验证站台码】检查第一个车次的站台码序列是否正确
+            if len(self.solution.route_lists) > 0:
+                first_rs = self.solution.route_lists[0]
+                route_id_str = str(first_rs.car_info.route_num)
+                
+                if route_id_str in self.rail_info.pathList:
+                    expected_codes = self.rail_info.pathList[route_id_str].nodeList
+                    actual_codes = first_rs.stopped_platforms
+                    
+                    print(f"\n[站台码验证] 车次{first_rs.car_info.table_num}（路径{route_id_str}）")
+                    print(f"  应有站台数: {len(expected_codes)}")
+                    print(f"  实际站台数: {len(actual_codes)}")
+                    
+                    if actual_codes == expected_codes:
+                        print(f"  [OK] 站台码序列完全一致！")
+                    else:
+                        print(f"  [ERROR] 站台码序列不一致")
+                        print(f"  应该是: {', '.join(expected_codes)}")
+                        print(f"  实际是: {', '.join(actual_codes)}")
+            
             return True
             
         except Exception as e:
@@ -447,10 +509,12 @@ class ExpressLocalSchedulerV3:
     
     def _create_route_solution_from_path(self, train: Train, route_id: str, path) -> RouteSolution:
         """
-        直接根据path.nodeList创建RouteSolution
+        根据path.nodeList创建RouteSolution，同时从timetable获取时刻（包含越行调整）
         
-        这个方法完全根据路径的站台码序列生成RouteSolution，
-        避免了timetable_builder生成的entries与path不匹配的问题。
+        【核心策略】：
+        1. 站台码100%使用path.nodeList（确保与XML一致）
+        2. 时刻按顺序从timetable_entries获取（保留越行调整）
+        3. 严格1对1顺序映射：path[i] -> timetable_entries[i]
         
         Args:
             train: 列车对象
@@ -496,56 +560,107 @@ class ExpressLocalSchedulerV3:
             
             rs.phase = 0
             
-            # 【关键】直接遍历path.nodeList（站台码列表）
+            # 获取path.nodeList（XML定义的正确站台码序列）
             path_destcodes = path.nodeList
+            
+            # 获取timetable条目（包含越行调整后的时刻）
+            timetable_entries = self.timetable.get_train_schedule(train.train_id)
+            
+            # 【关键】站台码使用path，时刻使用timetable，严格按顺序1对1映射
             current_time = dep_time
             
             for i, dest_code in enumerate(path_destcodes):
-                # 判断该站台是否停站
-                # 对于快车，检查是否在停站列表中
-                # 对于慢车，全部停站（除了折返轨等虚拟站台）
-                is_stop = self._should_stop_at_destcode(train, dest_code, i, len(path_destcodes))
-                
-                # 计算到站时间
-                if i == 0:
-                    # 首站：到站时间=发车时间
-                    arrival_time = current_time
+                # 优先使用timetable中的时刻（按顺序）
+                if i < len(timetable_entries):
+                    entry = timetable_entries[i]
+                    arrival_time = entry.arrival_time
+                    departure_time = entry.departure_time
+                    dwell_time = entry.dwell_time  # 包含越行调整后的停站时间（可能是240秒）
                 else:
-                    # 其他站：到站时间=上一站离站时间+运行时间
-                    prev_dest = path_destcodes[i-1]
-                    running_time = self._get_travel_time_between_destcodes(prev_dest, dest_code)
-                    arrival_time = current_time + running_time
-                
-                # 计算停站时间
-                if is_stop:
-                    if i == 0 or i == len(path_destcodes) - 1:
-                        dwell_time = 0  # 首末站不停站
+                    # 如果没有对应的entry（如首末站折返轨），重新计算
+                    if i == 0:
+                        arrival_time = current_time
                     else:
-                        dwell_time = self.default_dwell_time
-                else:
-                    dwell_time = 0
+                        running_time = self._get_travel_time_between_destcodes(path_destcodes[i-1], dest_code)
+                        arrival_time = current_time + running_time
+                    
+                    is_stop = self._should_stop_at_destcode(train, dest_code, i, len(path_destcodes))
+                    dwell_time = self.default_dwell_time if (is_stop and i > 0 and i < len(path_destcodes) - 1) else 0
+                    departure_time = arrival_time + dwell_time
                 
-                dep_time_at_station = arrival_time + dwell_time
-                
-                # 添加停站
+                # 使用path中的dest_code（100%正确）
                 rs.addStop(
                     platform=dest_code,
                     stop_time=dwell_time,
                     perf_level=self.speed_level,
                     current_time=arrival_time,
-                    dep_time=dep_time_at_station
+                    dep_time=departure_time
                 )
                 
-                # 更新当前时间
-                current_time = dep_time_at_station
+                current_time = departure_time
+            
+            # 严格验证站台码序列
+            if rs.stopped_platforms != path_destcodes:
+                print(f"[FATAL] 车次{train.train_id}（路径{route_id}）站台码错误！")
+                return None
             
             return rs
             
         except Exception as e:
-            print(f"[ERROR] 根据路径创建RouteSolution失败: {str(e)}")
+            print(f"[ERROR] 创建RouteSolution失败: {str(e)}")
             import traceback
             traceback.print_exc()
             return None
+    
+    def _create_route_solution_fallback(self, train: Train, route_id: str, path, rs: RouteSolution) -> RouteSolution:
+        """
+        当无法从timetable获取时刻表条目时的回退方法
+        重新计算时刻（不包含越行调整）
+        
+        Args:
+            train: 列车对象
+            route_id: 路径ID
+            path: 路径对象
+            rs: 已创建的RouteSolution对象
+            
+        Returns:
+            RouteSolution对象
+        """
+        path_destcodes = path.nodeList
+        dep_time = train.departure_time if train.departure_time else 0
+        current_time = dep_time
+        
+        for i, dest_code in enumerate(path_destcodes):
+            is_stop = self._should_stop_at_destcode(train, dest_code, i, len(path_destcodes))
+            
+            if i == 0:
+                arrival_time = current_time
+            else:
+                prev_dest = path_destcodes[i-1]
+                running_time = self._get_travel_time_between_destcodes(prev_dest, dest_code)
+                arrival_time = current_time + running_time
+            
+            if is_stop:
+                if i == 0 or i == len(path_destcodes) - 1:
+                    dwell_time = 0
+                else:
+                    dwell_time = self.default_dwell_time
+            else:
+                dwell_time = 0
+            
+            dep_time_at_station = arrival_time + dwell_time
+            
+            rs.addStop(
+                platform=dest_code,
+                stop_time=dwell_time,
+                perf_level=self.speed_level,
+                current_time=arrival_time,
+                dep_time=dep_time_at_station
+            )
+            
+            current_time = dep_time_at_station
+        
+        return rs
     
     def _should_stop_at_destcode(self, train: Train, dest_code: str, index: int, total: int) -> bool:
         """
