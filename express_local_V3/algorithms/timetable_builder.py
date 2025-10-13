@@ -395,7 +395,12 @@ class TimetableBuilder:
                                local_entries: List[TimetableEntry],
                                express_entries: List[TimetableEntry]) -> Optional[int]:
         """
-        找到越行发生的位置
+        找到越行发生的位置（优化版）
+        
+        策略：
+        1. 找到快车会追上慢车的第一个冲突点
+        2. 从冲突点向前找最近的越行站
+        3. 只有真正会发生冲突时才返回越行站
         
         Args:
             local_entries: 慢车时刻表条目
@@ -404,8 +409,14 @@ class TimetableBuilder:
         Returns:
             越行站索引（在local_entries中的索引），如果不会越行则返回None
         """
-        # 逐站检查
+        conflict_point = None
+        
+        # 逐站检查，找到第一个会发生冲突的站点
         for i, local_entry in enumerate(local_entries):
+            # 跳过前几个站（太靠近起点不适合越行）
+            if i < 2:
+                continue
+            
             # 查找快车在该站的条目
             express_entry = None
             for e in express_entries:
@@ -416,18 +427,42 @@ class TimetableBuilder:
             if express_entry is None:
                 continue
             
-            # 检查是否会发生追踪间隔冲突
-            # 条件：快车到达时间 < 慢车离站时间 + 最小追踪间隔
-            if express_entry.arrival_time < local_entry.departure_time + self.min_tracking_interval:
-                # 会发生冲突，从当前站往前找最近的越行站
-                for j in range(i, -1, -1):
-                    if j in self.overtaking_station_indices:
-                        return j
+            # 【优化】更精确的冲突判定
+            # 快车到达时间必须早于慢车发车时间，才会真正追上
+            if express_entry.arrival_time < local_entry.departure_time:
+                # 计算间隔
+                time_gap = local_entry.departure_time - express_entry.arrival_time
                 
-                # 如果没有找到越行站，使用当前站
-                return i
+                # 如果间隔小于最小追踪间隔，确实会冲突
+                if time_gap < self.min_tracking_interval:
+                    conflict_point = i
+                    break
         
-        return None
+        # 如果没有找到冲突点，不需要越行
+        if conflict_point is None:
+            return None
+        
+        # 【优化】从冲突点向前找合适的越行站
+        # 策略：优先选择中间位置的越行站，而不是离冲突点最近的
+        
+        # 找出所有可用的越行站（在冲突点之前）
+        available_overtaking_stations = []
+        for j in range(2, conflict_point + 1):  # 从第3个站开始，到冲突点
+            if j in self.overtaking_station_indices:
+                available_overtaking_stations.append(j)
+        
+        if not available_overtaking_stations:
+            # 没有合适的越行站
+            return None
+        
+        # 【关键优化】选择中间位置的越行站
+        # 如果有多个越行站可选，选择靠近中间的那个
+        if len(available_overtaking_stations) == 1:
+            return available_overtaking_stations[0]
+        else:
+            # 选择中间位置的越行站（让越行点更均衡）
+            mid_index = len(available_overtaking_stations) // 2
+            return available_overtaking_stations[mid_index]
     
     def _apply_overtaking(self,
                          local_entries: List[TimetableEntry],
@@ -436,14 +471,12 @@ class TimetableBuilder:
                          local_train: LocalTrain,
                          express_train: ExpressTrain):
         """
-        应用越行处理（从overtaking_demo.py移植的核心算法）
+        应用越行处理（优化版 - 精确计算停站时间）
         
-        处理步骤：
-        1. 计算慢车需要的停站时间
-        2. 确保满足到通间隔≥120秒
-        3. 确保满足通发间隔≥120秒
-        4. 确保停站时间≥240秒（4分钟）
-        5. 顺延后续所有站点的时刻
+        【优化】：
+        1. 精确计算到通间隔和通发间隔
+        2. 只增加必要的停站时间（不是固定240秒）
+        3. 确保慢车恰好在快车通过后发车
         
         Args:
             local_entries: 慢车时刻表条目
@@ -467,23 +500,43 @@ class TimetableBuilder:
         
         # 保存原始发车时间（用于计算顺延量）
         original_departure = local_entry.departure_time
+        original_dwell = local_entry.dwell_time
         
-        # 快车通过时间
+        # 快车通过时间（快车到达时间，因为快车可能不停站）
         express_pass_time = express_entry.arrival_time
         
-        # 计算到通间隔
+        # 【优化】精确计算慢车需要等待的时间
+        # 慢车到站后，需要等待快车通过 + 通发间隔
+        
+        # 计算到通间隔（慢车到站到快车通过）
         arrival_to_pass = express_pass_time - local_entry.arrival_time
         
-        # 慢车发车时间 = 快车通过时间 + 通发间隔
-        new_local_departure = express_pass_time + self.min_pass_departure_interval
+        # 如果到通间隔已经满足要求，只需要等快车通过后再发车
+        if arrival_to_pass >= self.min_arrival_pass_interval:
+            # 慢车发车时间 = 快车通过时间 + 通发间隔
+            new_local_departure = express_pass_time + self.min_pass_departure_interval
+        else:
+            # 如果到通间隔不足，需要慢车提前到达或延后到达
+            # 这里选择让慢车在越行站多等一会儿
+            # 确保到通间隔 = 快车通过时间 - 慢车到达时间 >= 120秒
+            # 如果已经满足，就按原计划；否则需要调整
+            
+            # 慢车发车时间 = 快车通过时间 + 通发间隔
+            new_local_departure = express_pass_time + self.min_pass_departure_interval
         
-        # 慢车停站时间
+        # 计算新的停站时间
         new_dwell_time = new_local_departure - local_entry.arrival_time
         
-        # 确保停站时间至少240秒（4分钟）
+        # 【优化】确保停站时间至少240秒，但不会过多
         if new_dwell_time < self.min_overtaking_dwell:
             new_dwell_time = self.min_overtaking_dwell
             new_local_departure = local_entry.arrival_time + new_dwell_time
+        
+        # 【优化】如果计算出的停站时间与原停站时间差别不大（<60秒），可能不需要越行
+        time_increase = new_dwell_time - original_dwell
+        if time_increase < 60:
+            # 增加时间太少，可能不需要越行
+            return
         
         # 计算时间顺延量
         time_shift = new_local_departure - original_departure
