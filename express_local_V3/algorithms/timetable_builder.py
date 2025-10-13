@@ -471,12 +471,13 @@ class TimetableBuilder:
                          local_train: LocalTrain,
                          express_train: ExpressTrain):
         """
-        应用越行处理（优化版 - 精确计算停站时间）
+        应用越行处理（精确版 - 快车通过时间在慢车停留的正中间）
         
-        【优化】：
-        1. 精确计算到通间隔和通发间隔
-        2. 只增加必要的停站时间（不是固定240秒）
-        3. 确保慢车恰好在快车通过后发车
+        【关键原则】：
+        1. 到通间隔 = 120秒（慢车到达 -> 快车通过）
+        2. 通发间隔 = 120秒（快车通过 -> 慢车发车）
+        3. 总停站时间 = 到通间隔 + 通发间隔 = 240秒
+        4. 快车通过时间 = 慢车到达时间 + 120秒（正好在中间）
         
         Args:
             local_entries: 慢车时刻表条目
@@ -498,52 +499,67 @@ class TimetableBuilder:
         if express_entry is None:
             return
         
-        # 保存原始发车时间（用于计算顺延量）
+        # 保存原始时间
         original_departure = local_entry.departure_time
+        original_arrival = local_entry.arrival_time
         original_dwell = local_entry.dwell_time
         
-        # 快车通过时间（快车到达时间，因为快车可能不停站）
+        # 【关键】快车通过时间（已确定，不能修改）
         express_pass_time = express_entry.arrival_time
         
-        # 【优化】精确计算慢车需要等待的时间
-        # 慢车到站后，需要等待快车通过 + 通发间隔
+        # 【核心原则】让快车通过时间位于慢车停留的正中间
+        # 
+        # 已知：
+        #   - 慢车到达时间：A（已确定，由前一站决定）
+        #   - 快车通过时间：E（已确定）
+        #   - 到通间隔 = E - A（已固定，不能改）
+        # 
+        # 目标：让快车在中间
+        #   - 通发间隔 = 到通间隔（这样快车就在正中间）
+        #   - 慢车发车时间 = E + 到通间隔
+        #   - 总停站时间 = 2 * 到通间隔
         
-        # 计算到通间隔（慢车到站到快车通过）
-        arrival_to_pass = express_pass_time - local_entry.arrival_time
+        # 计算实际的到通间隔
+        actual_arrival_to_pass = express_pass_time - local_entry.arrival_time
         
-        # 如果到通间隔已经满足要求，只需要等快车通过后再发车
-        if arrival_to_pass >= self.min_arrival_pass_interval:
-            # 慢车发车时间 = 快车通过时间 + 通发间隔
-            new_local_departure = express_pass_time + self.min_pass_departure_interval
-        else:
-            # 如果到通间隔不足，需要慢车提前到达或延后到达
-            # 这里选择让慢车在越行站多等一会儿
-            # 确保到通间隔 = 快车通过时间 - 慢车到达时间 >= 120秒
-            # 如果已经满足，就按原计划；否则需要调整
-            
-            # 慢车发车时间 = 快车通过时间 + 通发间隔
-            new_local_departure = express_pass_time + self.min_pass_departure_interval
+        # 【关键】让通发间隔等于到通间隔，快车就在中间！
+        ideal_pass_to_departure = actual_arrival_to_pass
         
-        # 计算新的停站时间
+        # 计算慢车发车时间
+        new_local_departure = express_pass_time + ideal_pass_to_departure
+        
+        # 计算停站时间
         new_dwell_time = new_local_departure - local_entry.arrival_time
+        # 应该等于 2 * 到通间隔
         
-        # 【优化】确保停站时间至少240秒，但不会过多
+        # 验证：确保到通间隔和通发间隔都满足最小要求（120秒）
+        if actual_arrival_to_pass < self.min_arrival_pass_interval:
+            # 到通间隔不足，需要增加通发间隔来补偿
+            ideal_pass_to_departure = self.min_pass_departure_interval
+            new_local_departure = express_pass_time + ideal_pass_to_departure
+            new_dwell_time = new_local_departure - local_entry.arrival_time
+        
+        if ideal_pass_to_departure < self.min_pass_departure_interval:
+            # 通发间隔不足，调整到最小值
+            new_local_departure = express_pass_time + self.min_pass_departure_interval
+            new_dwell_time = new_local_departure - local_entry.arrival_time
+        
+        # 确保总停站时间至少240秒
         if new_dwell_time < self.min_overtaking_dwell:
             new_dwell_time = self.min_overtaking_dwell
             new_local_departure = local_entry.arrival_time + new_dwell_time
         
-        # 【优化】如果计算出的停站时间与原停站时间差别不大（<60秒），可能不需要越行
+        # 【过滤】如果停站时间增加太少，不应用越行
         time_increase = new_dwell_time - original_dwell
         if time_increase < 60:
-            # 增加时间太少，可能不需要越行
             return
         
         # 计算时间顺延量
         time_shift = new_local_departure - original_departure
         
-        # 应用越行站的时间调整
-        local_entry.departure_time = new_local_departure
-        local_entry.dwell_time = new_dwell_time
+        # 应用越行站的时间调整（只调整发车时间和停站时间，不调整到达时间）
+        local_entry.departure_time = new_local_departure  # 调整发车时间
+        local_entry.dwell_time = new_dwell_time          # 调整停站时间
         local_entry.is_overtaking = True
         local_entry.overtaken_by = express_train.train_id
         local_entry.waiting_time = time_shift
