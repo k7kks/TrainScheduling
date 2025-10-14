@@ -14,9 +14,11 @@ class TimetableEntry:
     时刻表条目
     
     记录某列车在某车站的到发时刻、停站时间等信息
+    
+    【V3架构升级】新增path_index字段，作为与PathStationIndex对齐的主键
     """
     train_id: str               # 列车ID
-    station_id: str             # 车站ID（真正的车站ID）
+    station_id: str             # 车站ID（真正的车站ID，虚拟节点可为dest_code）
     station_name: str           # 车站名称
     
     # 时刻信息（秒）
@@ -43,6 +45,10 @@ class TimetableEntry:
     platform_id: Optional[str] = None       # 站台ID（用于内部引用）
     track_id: Optional[str] = None          # 股道ID
     dest_code: Optional[str] = None         # 站台目的地码（Destcode，用于输出）
+    
+    # 【NEW】路径索引对齐字段（核心改造）
+    path_index: Optional[int] = None        # 在路径中的顺序索引（0-based）
+    direction_hint: Optional[str] = None    # 方向提示（"up"/"down"，辅助匹配）
     
     @property
     def is_normal_stop(self) -> bool:

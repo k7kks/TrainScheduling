@@ -8,6 +8,7 @@ from .train import Train, ExpressTrain, LocalTrain, TrainType
 from .timetable_entry import TimetableEntry
 from .overtaking_event import OvertakingEvent
 from .express_local_timetable import ExpressLocalTimetable
+from .path_station_index import PathStationIndex, PathStationNode, build_path_station_index_from_path
 
 __all__ = [
     'Train',
@@ -16,6 +17,9 @@ __all__ = [
     'TrainType',
     'TimetableEntry',
     'OvertakingEvent',
-    'ExpressLocalTimetable'
+    'ExpressLocalTimetable',
+    'PathStationIndex',
+    'PathStationNode',
+    'build_path_station_index_from_path'
 ]
 

@@ -181,8 +181,8 @@ class ExpressLocalSchedulerV3:
             # 创建生成器
             self.generator = ExpressLocalGenerator(config)
             
-            # 创建时刻表构建器（重新启用越行）
-            self.builder = TimetableBuilder(self.rail_info, enable_overtaking=True)
+            # 创建时刻表构建器（暂时禁用越行，确保站台码100%正确）
+            self.builder = TimetableBuilder(self.rail_info, enable_overtaking=False)
             
             # 创建发车间隔优化器
             self.optimizer = HeadwayOptimizer(
@@ -305,6 +305,10 @@ class ExpressLocalSchedulerV3:
             print(f"  - 慢车数: {self.timetable.local_trains_count}")
             print(f"  - 总列车数: {self.timetable.total_trains}")
             
+            # 步骤1.5：修正所有列车的route_id（从硬编码的"R001"/"R002"改为实际路径ID）
+            print("\n[信息] 步骤1.5/4: 修正列车路径ID...")
+            self._fix_train_route_ids(peak)
+            
             # 步骤2：使用TimetableBuilder构建详细时刻表
             print("\n[信息] 步骤2/4: 构建详细时刻表...")
             self.timetable = self.builder.build_timetable(self.timetable)
@@ -400,11 +404,25 @@ class ExpressLocalSchedulerV3:
             print(f"  发现越行站数: {overtaking_station_found}")
             print(f"  被越行的慢车数: {len(overtaking_trains)}")
             
+            # 【调试】显示前3个越行站的详细时间
             if overtaking_station_found > 0:
-                print(f"  [OK] 越行时刻已正确保存到RouteSolution")
+                print(f"\n[越行详细验证] 前3个越行站的时间验证:")
+                checked = 0
+                for rs in self.solution.route_lists:
+                    if not getattr(rs, 'is_express', False) and checked < 3:
+                        for i, dwell in enumerate(rs.stopped_time):
+                            if dwell >= 200:
+                                arr = rs.arr_time[i]
+                                dep = rs.dep_time[i]
+                                actual_dwell = dep - arr
+                                print(f"  车次{rs.car_info.table_num}: 到{arr}秒, 发{dep}秒, 停{actual_dwell}秒")
+                                checked += 1
+                                if checked >= 3:
+                                    break
+                
+                print(f"\n  [OK] 越行时刻已正确保存到RouteSolution")
                 if overtaking_station_found < 25:
                     print(f"  [注意] 检测到25次越行事件，但只有{overtaking_station_found}个越行站停站时间≥200秒")
-                    print(f"  [可能原因] 部分越行的停站时间调整未正确应用到RouteSolution")
             else:
                 print(f"  [WARNING] 未发现越行站（停站时间≥200秒）")
                 print(f"  [WARNING] 越行调整未正确应用到RouteSolution")
@@ -566,29 +584,30 @@ class ExpressLocalSchedulerV3:
             # 获取timetable条目（包含越行调整后的时刻）
             timetable_entries = self.timetable.get_train_schedule(train.train_id)
             
-            # 【关键】站台码使用path，时刻使用timetable，严格按顺序1对1映射
-            current_time = dep_time
+            # 【V3架构 - 严格索引模式】禁止回退计算，强制对齐
+            # 核心原则：timetable_entries 必须与 path.nodeList 完全一致
             
+            if len(timetable_entries) != len(path_destcodes):
+                print(f"[错误] 列车{train.train_id}的时刻表条目数({len(timetable_entries)})与路径节点数({len(path_destcodes)})不一致！")
+                print(f"  时刻表条目: {[e.dest_code for e in timetable_entries]}")
+                print(f"  路径节点:   {path_destcodes}")
+                print(f"  [FATAL] 禁止自动补齐，请检查TimetableBuilder逻辑！")
+                return None
+            
+            # 【关键】严格按path_index顺序遍历，使用timetable_entries中的时刻信息
             for i, dest_code in enumerate(path_destcodes):
-                # 优先使用timetable中的时刻（按顺序）
-                if i < len(timetable_entries):
-                    entry = timetable_entries[i]
-                    arrival_time = entry.arrival_time
-                    departure_time = entry.departure_time
-                    dwell_time = entry.dwell_time  # 包含越行调整后的停站时间（可能是240秒）
-                else:
-                    # 如果没有对应的entry（如首末站折返轨），重新计算
-                    if i == 0:
-                        arrival_time = current_time
-                    else:
-                        running_time = self._get_travel_time_between_destcodes(path_destcodes[i-1], dest_code)
-                        arrival_time = current_time + running_time
-                    
-                    is_stop = self._should_stop_at_destcode(train, dest_code, i, len(path_destcodes))
-                    dwell_time = self.default_dwell_time if (is_stop and i > 0 and i < len(path_destcodes) - 1) else 0
-                    departure_time = arrival_time + dwell_time
+                entry = timetable_entries[i]
                 
-                # 使用path中的dest_code（100%正确）
+                # 验证dest_code一致性（如果entry有dest_code的话）
+                if entry.dest_code and entry.dest_code != dest_code:
+                    print(f"[警告] 列车{train.train_id}在索引{i}处dest_code不一致: entry={entry.dest_code}, path={dest_code}")
+                
+                # 使用entry中的时刻信息（包含越行调整）
+                arrival_time = entry.arrival_time
+                departure_time = entry.departure_time
+                dwell_time = entry.dwell_time
+                
+                # 【关键】使用path中的dest_code（确保站台码100%正确）
                 rs.addStop(
                     platform=dest_code,
                     stop_time=dwell_time,
@@ -596,12 +615,12 @@ class ExpressLocalSchedulerV3:
                     current_time=arrival_time,
                     dep_time=departure_time
                 )
-                
-                current_time = departure_time
             
-            # 严格验证站台码序列
+            # 严格验证站台码
             if rs.stopped_platforms != path_destcodes:
-                print(f"[FATAL] 车次{train.train_id}（路径{route_id}）站台码错误！")
+                print(f"[FATAL] 车次{train.train_id}站台码验证失败！")
+                print(f"  RouteSolution: {rs.stopped_platforms}")
+                print(f"  Path:          {path_destcodes}")
                 return None
             
             return rs
@@ -738,13 +757,18 @@ class ExpressLocalSchedulerV3:
         # 默认运行时间
         return 120
     
-    def _adjust_entries_to_path(self, entries: List[TimetableEntry], 
+    def _adjust_entries_to_path_DEPRECATED(self, entries: List[TimetableEntry], 
                                 path_destcodes: List[str], 
                                 train: Train) -> List[TimetableEntry]:
         """
-        调整时刻表条目以匹配路径的站台码序列
+        【已废弃 - V3架构改造】
         
-        当entries数量少于path_destcodes时，补充缺失的站台（通常是折返轨等虚拟站台）
+        旧版调整时刻表条目以匹配路径的站台码序列
+        
+        V3架构改造后，此方法已被废弃，因为：
+        1. TimetableBuilder现在基于PathStationIndex生成完整的entries
+        2. convert_timetable_to_solution采用严格索引模式，禁止自动补齐
+        3. 自动补齐逻辑会破坏越行调整的时刻信息
         
         Args:
             entries: 原始时刻表条目列表
@@ -754,6 +778,7 @@ class ExpressLocalSchedulerV3:
         Returns:
             调整后的时刻表条目列表
         """
+        print("[WARNING] _adjust_entries_to_path_DEPRECATED 已被废弃，请使用新的PathStationIndex架构")
         from models.timetable_entry import TimetableEntry
         
         if len(entries) >= len(path_destcodes):
@@ -805,6 +830,36 @@ class ExpressLocalSchedulerV3:
             print(f"[WARNING] 调整后entries数量({len(adjusted_entries)})仍与path_destcodes({len(path_destcodes)})不一致")
         
         return adjusted_entries
+    
+    def _fix_train_route_ids(self, peak):
+        """
+        修正所有列车的route_id
+        
+        将硬编码的"R001"/"R002"替换为实际的路径ID，
+        以便TimetableBuilder能够正确查找PathStationIndex
+        
+        Args:
+            peak: 峰期对象
+        """
+        all_trains = self.timetable.express_trains + self.timetable.local_trains
+        fixed_count = 0
+        
+        for train in all_trains:
+            # 获取正确的路径ID
+            correct_route_id = self._get_route_id_for_train(train, peak)
+            
+            if correct_route_id:
+                old_route_id = train.route_id
+                train.route_id = correct_route_id
+                
+                if self.debug and old_route_id != correct_route_id:
+                    print(f"  [修正] {train.train_id}: {old_route_id} -> {correct_route_id}")
+                
+                fixed_count += 1
+            else:
+                print(f"  [警告] 无法获取列车{train.train_id}的正确路径ID")
+        
+        print(f"[OK] 修正了 {fixed_count}/{len(all_trains)} 个列车的路径ID")
     
     def _get_route_id_for_train(self, train: Train, peak) -> Optional[str]:
         """
@@ -1100,7 +1155,7 @@ class ExpressLocalSchedulerV3:
             output_path = Path(self.output_dir)
             output_path.mkdir(parents=True, exist_ok=True)
             
-            # 重新编号路线（基于规则的算法）
+            # 重新编号路线
             self.solution.renumb_routes()
             
             # 修改每个RouteSolution的retCSVStringPlanned_num方法，设置正确的快车标志位

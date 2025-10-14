@@ -11,8 +11,10 @@
 | 文档 | 说明 | 适用人群 |
 |------|------|----------|
 | [README.md](../README.md) | 项目概述、功能介绍、安装说明 | 所有用户 ⭐ |
+| [README_START_HERE.md](README_START_HERE.md) | 快速入门指南 | 新用户 ⭐ |
 | [QUICKSTART.md](QUICKSTART.md) | 快速入门指南、示例代码 | 新用户 ⭐ |
-| [QUICK_REFERENCE.md](../QUICK_REFERENCE.md) | 常用API和参数速查表 | 开发者 |
+| [使用指南_最终版.md](使用指南_最终版.md) | 详细使用指南 | 所有用户 ⭐ |
+| [FOLDER_STRUCTURE_GUIDE.md](FOLDER_STRUCTURE_GUIDE.md) | 文件夹结构说明 | 开发者 ⭐ |
 
 ### 📖 核心文档
 
@@ -20,7 +22,35 @@
 |------|------|----------|
 | [EXPRESS_LOCAL_MODEL_DESIGN.md](EXPRESS_LOCAL_MODEL_DESIGN.md) | 系统架构设计、算法详解 | 开发者、研究者 ⭐ |
 | [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md) | 项目总结、核心功能说明 | 项目管理者 |
-| [VERSION_HISTORY.md](../VERSION_HISTORY.md) | 版本历史和更新记录 | 所有用户 |
+| [PROJECT_COMPLETE_SUMMARY.md](PROJECT_COMPLETE_SUMMARY.md) | 项目完整总结 | 项目管理者 ⭐ |
+| [交付清单.md](交付清单.md) | 项目交付清单 | 项目管理者 |
+| [VERSION_INFO.md](VERSION_INFO.md) | 详细版本信息 | 所有用户 ⭐ |
+| [最终版本说明.md](最终版本说明.md) | 最终版本说明 | 所有用户 |
+| [GIT_VERSION_SUMMARY.md](GIT_VERSION_SUMMARY.md) | Git版本管理总结 | 开发者 |
+| [GIT_VERSION_20251013_102814.md](GIT_VERSION_20251013_102814.md) | Git版本快照 | 开发者 |
+| [GIT_QUICK_REFERENCE.md](GIT_QUICK_REFERENCE.md) | Git快速参考 | 开发者 |
+
+### 🚄 越行功能文档
+
+| 文档 | 说明 | 适用人群 |
+|------|------|----------|
+| [使用说明_越行功能.md](使用说明_越行功能.md) | 越行功能使用说明 | 所有用户 ⭐ |
+| [README_越行功能.md](README_越行功能.md) | 越行功能快速指南 | 新用户 |
+| [越行功能验证报告.md](越行功能验证报告.md) | 越行功能验证报告 | 测试人员 |
+| [越行功能集成完成报告.md](越行功能集成完成报告.md) | 越行集成完成报告 | 开发者 ⭐ |
+| [越行优化说明_20251013.md](越行优化说明_20251013.md) | 越行优化详解 | 开发者 |
+| [越行时间验证.md](越行时间验证.md) | 越行时间验证 | 测试人员 |
+| [如何在运行图中查看越行.md](如何在运行图中查看越行.md) | 越行查看指南 | 所有用户 |
+
+### 🛠️ 技术与修复文档
+
+| 文档 | 说明 | 重要性 |
+|------|------|--------|
+| [最终修复完成总结.md](最终修复完成总结.md) | 最终修复总结 | ⭐⭐⭐ |
+| [站台码问题修复报告.md](站台码问题修复报告.md) | 站台码修复报告 | ⭐⭐ |
+| [运行图显示问题排查指南.md](运行图显示问题排查指南.md) | 问题排查指南 | ⭐⭐ |
+| [版本对比_优化前后.md](版本对比_优化前后.md) | 版本优化对比 | ⭐ |
+| [FINAL_VERIFICATION.md](FINAL_VERIFICATION.md) | 最终验证报告 | ⭐⭐ |
 
 ### 🔧 修复文档
 
@@ -72,17 +102,38 @@
 ```
 express_local_V3/
 ├── README.md                          # 项目概述 ⭐
-├── QUICK_REFERENCE.md                 # 快速参考
-├── VERSION_HISTORY.md                 # 版本历史
 ├── requirements.txt                   # Python依赖
 ├── main.py                            # 主程序入口
+├── __init__.py                        # 包初始化
 │
-├── docs/                              # 📚 文档目录
+├── docs/                              # 📚 文档中心（所有文档集中存放）
 │   ├── INDEX.md                       # 本文档索引 ⭐
+│   ├── FOLDER_STRUCTURE_GUIDE.md      # 文件夹结构说明 ⭐
+│   ├── README_START_HERE.md           # 快速入门 ⭐
+│   ├── 使用指南_最终版.md              # 详细使用指南 ⭐
 │   ├── QUICKSTART.md                  # 快速入门
 │   ├── EXPRESS_LOCAL_MODEL_DESIGN.md  # 设计文档 ⭐
 │   ├── PROJECT_SUMMARY.md             # 项目总结
+│   ├── PROJECT_COMPLETE_SUMMARY.md    # 项目完整总结
 │   ├── CHANGELOG.md                   # 变更日志
+│   ├── 交付清单.md                     # 交付清单
+│   ├── VERSION_INFO.md                # 版本信息 ⭐
+│   ├── 最终版本说明.md                 # 最终版本说明
+│   ├── GIT_VERSION_SUMMARY.md         # Git版本总结
+│   │
+│   ├── 使用说明_越行功能.md            # 越行功能说明 ⭐
+│   ├── README_越行功能.md              # 越行快速指南
+│   ├── 越行功能验证报告.md             # 越行验证报告
+│   ├── 越行功能集成完成报告.md         # 越行集成报告
+│   ├── 越行优化说明_20251013.md        # 越行优化详解
+│   ├── 越行时间验证.md                 # 越行时间验证
+│   ├── 如何在运行图中查看越行.md        # 越行查看指南
+│   │
+│   ├── 最终修复完成总结.md             # 最终修复总结
+│   ├── 站台码问题修复报告.md           # 站台码修复报告
+│   ├── 运行图显示问题排查指南.md        # 问题排查指南
+│   ├── 版本对比_优化前后.md            # 版本对比
+│   ├── FINAL_VERIFICATION.md          # 最终验证报告
 │   │
 │   └── fixes/                         # 🔧 修复文档
 │       ├── FIXES_INDEX.md             # 修复总索引 ⭐
@@ -91,14 +142,22 @@ express_local_V3/
 │       ├── DESTCODE_PATH_FIX.md
 │       ├── PLATFORM_COUNT_FIX.md
 │       ├── ROUTE_NUM_FIX_SUMMARY.md
-│       ├── DESTCODE_FIX_SUMMARY.md
-│       └── FIXES_VALIDATION_REPORT.md
+│       └── ...（更多修复文档）
+│
+├── logs/                              # 📋 日志文件（所有日志集中存放）
+│   ├── debug_*.log                    # 调试日志
+│   ├── check_*.log                    # 检查日志
+│   ├── verify_*.log                   # 验证日志
+│   ├── test_*.log                     # 测试日志
+│   ├── run_*.log                      # 运行日志
+│   └── final_*.log                    # 最终测试日志
 │
 ├── algorithms/                        # 🧮 算法模块
 │   ├── express_local_generator.py     # 快慢车生成器
 │   ├── timetable_builder.py           # 时刻表构建器
 │   ├── overtaking_detector.py         # 越行检测器
-│   └── headway_optimizer.py           # 发车间隔优化器
+│   ├── headway_optimizer.py           # 发车间隔优化器
+│   └── connection_manager.py          # 连接管理器
 │
 ├── models/                            # 📊 数据模型
 │   ├── train.py                       # 列车模型
@@ -109,8 +168,13 @@ express_local_V3/
 ├── output/                            # 📤 输出模块
 │   └── excel_exporter.py              # Excel导出器
 │
+├── data/                              # 📊 数据文件
+│   └── output/                        # 输出数据和图表
+│
 ├── examples/                          # 💡 示例代码
-│   └── example_usage.py               # 使用示例
+│   ├── example_usage.py               # 基础示例
+│   ├── overtaking_demo.py             # 越行演示
+│   └── *.md                           # 示例文档
 │
 ├── tests/                             # 🧪 测试代码
 │   ├── test_imports.py                # 导入测试
@@ -119,7 +183,10 @@ express_local_V3/
 │
 └── scripts/                           # 🛠️ 工具脚本
     ├── run.py                         # 运行脚本
-    └── check_output.py                # 输出检查脚本
+    ├── verify_*.py                    # 验证脚本
+    ├── check_*.py                     # 检查脚本
+    ├── debug_*.py                     # 调试脚本
+    └── analyze_*.py                   # 分析脚本
 ```
 
 ---
@@ -129,9 +196,10 @@ express_local_V3/
 ### 对于新用户
 
 1. ⭐ [README.md](../README.md) - 了解项目是什么
-2. ⭐ [QUICKSTART.md](QUICKSTART.md) - 快速上手
-3. [examples/example_usage.py](../examples/example_usage.py) - 查看示例代码
-4. [QUICK_REFERENCE.md](../QUICK_REFERENCE.md) - 查找常用API
+2. ⭐ [README_START_HERE.md](README_START_HERE.md) - 快速入门指南
+3. ⭐ [使用指南_最终版.md](使用指南_最终版.md) - 详细使用说明
+4. ⭐ [FOLDER_STRUCTURE_GUIDE.md](FOLDER_STRUCTURE_GUIDE.md) - 了解项目结构
+5. [examples/example_usage.py](../examples/example_usage.py) - 查看示例代码
 
 ### 对于开发者
 
