@@ -31,6 +31,7 @@ namespace {
 
 fs::path resolve_tool_script_path(const std::string& script_name);
 bool python_has_gurobipy(const std::string& python_exe, bool debug);
+bool python_has_coinmp(const std::string& python_exe, bool debug);
 
 constexpr double kEps = 1e-8;
 
@@ -323,6 +324,19 @@ std::vector<DynamicRowPayload> build_incremental_depot_gate_rows(
     const std::vector<Column>& columns,
     std::size_t start_index,
     DepotGateStats* stats = nullptr
+);
+
+MasterSolveResult solve_master_with_coinmp(
+    const Instance& instance,
+    const std::vector<Column>& columns,
+    bool integer_master,
+    const std::unordered_set<int>& fixed_column_ids,
+    const fs::path& work_dir,
+    const std::string& python_exe,
+    int master_time_limit_sec,
+    double mip_gap,
+    const std::string& tag,
+    bool debug
 );
 
 ActiveConflictRows collect_active_conflict_rows(const Instance& instance, const std::vector<Column>& columns);
@@ -1813,7 +1827,7 @@ std::vector<DynamicRowPayload> build_incremental_depot_gate_rows(
     const Instance& instance,
     const std::vector<Column>& columns,
     std::size_t loaded_column_count,
-    DepotGateStats* stats = nullptr
+    DepotGateStats* stats
 ) {
     std::vector<DynamicRowPayload> rows;
     if (instance.depot_route_by_key.empty() || columns.empty()) {
@@ -3150,11 +3164,35 @@ MasterSolveResult solve_master_with_cbc(
     const std::unordered_set<int>& fixed_column_ids,
     const fs::path& work_dir,
     const std::string& cbc_path,
+    const std::string& python_exe,
     int master_time_limit_sec,
     double mip_gap,
     const std::string& tag,
     bool debug
 ) {
+    try {
+        auto result = solve_master_with_coinmp(
+            instance,
+            columns,
+            integer_master,
+            fixed_column_ids,
+            work_dir,
+            python_exe,
+            master_time_limit_sec,
+            mip_gap,
+            tag,
+            debug
+        );
+        result.requested_solver = "CBC";
+        result.actual_solver = "CBC_COINMP";
+        return result;
+    } catch (const std::exception& e) {
+        if (debug) {
+            std::cout << "[debug] CoinMP bridge failed for " << tag << ", falling back to CBC CLI: "
+                      << e.what() << "\n";
+        }
+    }
+
     fs::create_directories(work_dir);
     const fs::path lp_path = work_dir / (tag + ".lp");
     const fs::path solution_path = work_dir / (tag + ".sol");
@@ -3630,6 +3668,342 @@ private:
     }
 };
 
+class PersistentCoinMPMasterSession {
+public:
+    PersistentCoinMPMasterSession(
+        const Instance& instance,
+        fs::path session_dir,
+        std::string python_exe,
+        bool debug
+    ) : instance_(instance),
+        session_dir_(std::move(session_dir)),
+        python_exe_(std::move(python_exe)),
+        debug_(debug) {
+        request_path_ = session_dir_ / "request.json";
+        response_path_ = session_dir_ / "response.json";
+    }
+
+    ~PersistentCoinMPMasterSession() {
+        shutdown();
+    }
+
+    MasterSolveResult solve(
+        const std::vector<Column>& columns,
+        const std::unordered_set<int>& fixed_column_ids,
+        int master_time_limit_sec
+    ) {
+        start_server();
+        if (!initialized_) {
+            return initialize_and_solve(columns, fixed_column_ids, master_time_limit_sec);
+        }
+        if (columns.size() < loaded_column_count_) {
+            throw std::runtime_error("Persistent CoinMP master column count is inconsistent");
+        }
+        return add_columns_and_solve(columns, fixed_column_ids, master_time_limit_sec);
+    }
+
+    void shutdown() {
+        if (!started_) {
+            return;
+        }
+        try {
+            write_request_json("{\"command\":\"shutdown\"}");
+            wait_for_response(5000);
+        } catch (...) {
+        }
+        std::error_code ec;
+        fs::remove(request_path_, ec);
+        fs::remove(response_path_, ec);
+        started_ = false;
+        initialized_ = false;
+        loaded_column_count_ = 0;
+        loaded_fixed_column_ids_.clear();
+    }
+
+private:
+    const Instance& instance_;
+    fs::path session_dir_;
+    fs::path request_path_;
+    fs::path response_path_;
+    std::string python_exe_;
+    bool debug_ = false;
+    bool started_ = false;
+    bool initialized_ = false;
+    std::size_t loaded_column_count_ = 0;
+    std::unordered_set<int> loaded_fixed_column_ids_;
+
+    void start_server() {
+        if (started_) {
+            return;
+        }
+        fs::create_directories(session_dir_);
+        std::error_code ec;
+        fs::remove(request_path_, ec);
+        fs::remove(response_path_, ec);
+        const fs::path script_path = resolve_tool_script_path("persistent_coinmp_master_session.py");
+        if (!fs::exists(script_path)) {
+            throw std::runtime_error("Persistent CoinMP session script not found: " + script_path.string());
+        }
+
+#ifdef _WIN32
+        std::vector<std::wstring> argv_storage = {
+            fs::path(python_exe_.empty() ? "python" : python_exe_).wstring(),
+            script_path.wstring(),
+            L"--session-dir",
+            session_dir_.wstring()
+        };
+        std::vector<const wchar_t*> argv;
+        argv.reserve(argv_storage.size() + 1);
+        for (const auto& arg : argv_storage) {
+            argv.push_back(arg.c_str());
+        }
+        argv.push_back(nullptr);
+        const intptr_t proc = _wspawnvp(_P_NOWAIT, argv_storage.front().c_str(), argv.data());
+        if (proc == -1) {
+            throw std::runtime_error("Failed to launch persistent CoinMP master session");
+        }
+#else
+        std::string command = quote(python_exe_.empty() ? "python" : python_exe_)
+            + " " + quote(script_path.string())
+            + " --session-dir " + quote(session_dir_.string()) + " &";
+        const int proc = std::system(command.c_str());
+        if (proc != 0) {
+            throw std::runtime_error("Failed to launch persistent CoinMP master session");
+        }
+#endif
+        started_ = true;
+    }
+
+    MasterSolveResult initialize_and_solve(
+        const std::vector<Column>& columns,
+        const std::unordered_set<int>& fixed_column_ids,
+        int master_time_limit_sec
+    ) {
+        std::ostringstream request;
+        request << "{"
+                << "\"command\":\"init_solve\","
+                << "\"time_limit\":" << master_time_limit_sec << ","
+                << "\"log_to_console\":" << (debug_ ? 1 : 0) << ",";
+        append_master_model_json(request, instance_, columns, false, fixed_column_ids);
+        request << "}";
+        write_request_json(request.str());
+        MasterSolveResult result = read_response_result();
+        result.requested_solver = "CBC";
+        result.actual_solver = "CBC_PERSISTENT";
+        initialized_ = true;
+        loaded_column_count_ = columns.size();
+        loaded_fixed_column_ids_ = fixed_column_ids;
+        return result;
+    }
+
+    MasterSolveResult add_columns_and_solve(
+        const std::vector<Column>& columns,
+        const std::unordered_set<int>& fixed_column_ids,
+        int master_time_limit_sec
+    ) {
+        const auto new_rows = build_incremental_depot_gate_rows(instance_, columns, loaded_column_count_);
+        std::ostringstream request;
+        request << "{"
+                << "\"command\":\"add_columns_and_solve\","
+                << "\"time_limit\":" << master_time_limit_sec << ","
+                << "\"log_to_console\":" << (debug_ ? 1 : 0) << ","
+                << "\"columns\":[";
+        for (std::size_t index = loaded_column_count_; index < columns.size(); ++index) {
+            if (index > loaded_column_count_) {
+                request << ",";
+            }
+            const auto& column = columns[index];
+            const auto row_coeffs = build_master_column_row_coeffs(instance_, column);
+            request << "{"
+                    << "\"var_name\":\"" << json_escape(var_name_column(column.id)) << "\","
+                    << "\"cost\":" << format_coeff(column.cost) << ","
+                    << "\"lb\":0.0,"
+                    << "\"ub\":1.0,"
+                    << "\"vtype\":\"C\","
+                    << "\"row_coeffs\":[";
+            for (std::size_t coeff_index = 0; coeff_index < row_coeffs.size(); ++coeff_index) {
+                if (coeff_index > 0) {
+                    request << ",";
+                }
+                request << "{"
+                        << "\"row_name\":\"" << json_escape(row_coeffs[coeff_index].row_name) << "\","
+                        << "\"coeff\":" << format_coeff(row_coeffs[coeff_index].coeff)
+                        << "}";
+            }
+            request << "]"
+                    << "}";
+        }
+        request << "],"
+                << "\"bound_updates\":[";
+        bool first_bound_update = true;
+        for (const int column_id : fixed_column_ids) {
+            if (loaded_fixed_column_ids_.count(column_id) != 0) {
+                continue;
+            }
+            if (!first_bound_update) {
+                request << ",";
+            }
+            first_bound_update = false;
+            request << "{"
+                    << "\"var_name\":\"" << json_escape(var_name_column(column_id)) << "\","
+                    << "\"lb\":1.0,"
+                    << "\"ub\":1.0"
+                    << "}";
+        }
+        request << "],"
+                << "\"new_rows\":[";
+        for (std::size_t row_index = 0; row_index < new_rows.size(); ++row_index) {
+            if (row_index > 0) {
+                request << ",";
+            }
+            request << "{"
+                    << "\"row_name\":\"" << json_escape(new_rows[row_index].row_name) << "\","
+                    << "\"sense\":\"" << json_escape(new_rows[row_index].sense) << "\","
+                    << "\"rhs\":" << format_coeff(new_rows[row_index].rhs) << ","
+                    << "\"terms\":[";
+            for (std::size_t term_index = 0; term_index < new_rows[row_index].terms.size(); ++term_index) {
+                if (term_index > 0) {
+                    request << ",";
+                }
+                request << "{"
+                        << "\"var_name\":\"" << json_escape(new_rows[row_index].terms[term_index].var_name) << "\","
+                        << "\"coeff\":" << format_coeff(new_rows[row_index].terms[term_index].coeff)
+                        << "}";
+            }
+            request << "]"
+                    << "}";
+        }
+        request << "]"
+                << "}";
+        write_request_json(request.str());
+        MasterSolveResult result = read_response_result();
+        result.requested_solver = "CBC";
+        result.actual_solver = "CBC_PERSISTENT";
+        loaded_column_count_ = columns.size();
+        loaded_fixed_column_ids_ = fixed_column_ids;
+        return result;
+    }
+
+    void write_request_json(const std::string& payload) {
+        const fs::path tmp_path = request_path_.string() + ".tmp";
+        {
+            std::ofstream out(tmp_path);
+            out << payload;
+        }
+        std::error_code ec;
+        fs::remove(response_path_, ec);
+        fs::rename(tmp_path, request_path_, ec);
+        if (ec) {
+            throw std::runtime_error("Failed to write persistent CoinMP master request: " + ec.message());
+        }
+    }
+
+    void wait_for_response(int timeout_ms) const {
+        const auto start = std::chrono::steady_clock::now();
+        while (!fs::exists(response_path_)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start
+            ).count();
+            if (elapsed > timeout_ms) {
+                throw std::runtime_error("Timed out waiting for persistent CoinMP master response");
+            }
+        }
+    }
+
+    MasterSolveResult read_response_result() {
+        wait_for_response(3600000);
+        MasterSolveResult result = parse_gurobi_json_solution(response_path_);
+        std::error_code ec;
+        fs::remove(response_path_, ec);
+        if (!result.ok) {
+            throw std::runtime_error("Persistent CoinMP master solve failed: " + result.status);
+        }
+        return result;
+    }
+};
+
+MasterSolveResult solve_master_with_coinmp(
+    const Instance& instance,
+    const std::vector<Column>& columns,
+    bool integer_master,
+    const std::unordered_set<int>& fixed_column_ids,
+    const fs::path& work_dir,
+    const std::string& python_exe,
+    int master_time_limit_sec,
+    double mip_gap,
+    const std::string& tag,
+    bool debug
+) {
+    fs::create_directories(work_dir);
+    const fs::path model_json_path = work_dir / (tag + "_model.json");
+    const fs::path json_sol_path = work_dir / (tag + "_sol.json");
+    std::error_code ec;
+    fs::remove(json_sol_path, ec);
+    write_master_model_json(instance, columns, integer_master, fixed_column_ids, model_json_path);
+
+    const fs::path script_path = resolve_tool_script_path("solve_master_with_coinmp.py");
+    if (!fs::exists(script_path)) {
+        throw std::runtime_error("CoinMP bridge script not found: " + script_path.string());
+    }
+
+#ifdef _WIN32
+    std::vector<std::wstring> argv_storage = {
+        fs::path(python_exe.empty() ? "python" : python_exe).wstring(),
+        script_path.wstring(),
+        L"--model-json",
+        model_json_path.wstring(),
+        L"--out-json",
+        json_sol_path.wstring(),
+        L"--integer",
+        std::to_wstring(integer_master ? 1 : 0),
+        L"--time-limit",
+        std::to_wstring(master_time_limit_sec),
+        L"--mip-gap",
+        fs::path(format_coeff(mip_gap)).wstring(),
+        L"--log-to-console",
+        std::to_wstring(debug ? 1 : 0)
+    };
+    std::vector<const wchar_t*> argv;
+    argv.reserve(argv_storage.size() + 1);
+    for (const auto& arg : argv_storage) {
+        argv.push_back(arg.c_str());
+    }
+    argv.push_back(nullptr);
+    if (debug) {
+        std::cout << "[debug] CoinMP(Python) argv:";
+        for (const auto& arg : argv_storage) {
+            std::cout << " [" << fs::path(arg).string() << "]";
+        }
+        std::cout << "\n";
+    }
+    const intptr_t exit_code = _wspawnvp(_P_WAIT, argv_storage.front().c_str(), argv.data());
+#else
+    std::string command = quote(python_exe.empty() ? "python" : python_exe)
+        + " " + quote(script_path.string())
+        + " --model-json " + quote(model_json_path.string())
+        + " --out-json " + quote(json_sol_path.string())
+        + " --integer " + std::to_string(integer_master ? 1 : 0)
+        + " --time-limit " + std::to_string(master_time_limit_sec)
+        + " --mip-gap " + format_coeff(mip_gap)
+        + " --log-to-console " + std::to_string(debug ? 1 : 0);
+    const int exit_code = std::system(command.c_str());
+#endif
+    if (!fs::exists(json_sol_path)) {
+        throw std::runtime_error("CoinMP bridge did not produce solution file for " + tag);
+    }
+    auto result = parse_gurobi_json_solution(json_sol_path);
+    if (!result.ok) {
+        throw std::runtime_error("CoinMP bridge solve failed for " + tag + ": " + result.status);
+    }
+    if (exit_code != 0) {
+        throw std::runtime_error("CoinMP bridge exited with code " + std::to_string(static_cast<int>(exit_code))
+                                 + " for " + tag + ": " + result.status);
+    }
+    result.actual_solver = "CBC_COINMP";
+    return result;
+}
+
 MasterSolveResult solve_master_with_gurobi(
     const Instance& instance,
     const std::vector<Column>& columns,
@@ -3790,7 +4164,7 @@ MasterSolveResult solve_master(
         } catch (const std::exception& e) {
             std::cout << "[warn] Gurobi failed (" << e.what() << "), falling back to CBC\n";
             auto result = solve_master_with_cbc(instance, columns, integer_master, fixed_column_ids, work_dir,
-                                                cbc_path, master_time_limit_sec, mip_gap,
+                                                cbc_path, python_exe, master_time_limit_sec, mip_gap,
                                                 tag, debug);
             result.requested_solver = "GUROBI";
             result.fallback_used = true;
@@ -3802,7 +4176,7 @@ MasterSolveResult solve_master(
         }
     }
     auto result = solve_master_with_cbc(instance, columns, integer_master, fixed_column_ids, work_dir,
-                                        cbc_path, master_time_limit_sec, mip_gap,
+                                        cbc_path, python_exe, master_time_limit_sec, mip_gap,
                                         tag, debug);
     result.requested_solver = solver.empty() ? "CBC" : solver;
     if (result.actual_solver.empty()) {
@@ -4705,6 +5079,15 @@ long long last_depot_gate_pairwise_conflicts(const std::vector<IterationLog>& lo
 
 bool persistent_master_used(const std::vector<IterationLog>& logs) {
     for (const auto& log : logs) {
+        if (log.actual_solver == "GUROBI_PERSISTENT" || log.actual_solver == "CBC_PERSISTENT") {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool persistent_gurobi_master_used(const std::vector<IterationLog>& logs) {
+    for (const auto& log : logs) {
         if (log.actual_solver == "GUROBI_PERSISTENT") {
             return true;
         }
@@ -4789,7 +5172,8 @@ void write_summary_json(
     out << "  \"tcg_fix_min_value\": " << format_coeff(config.tcg_fix_min_value) << ",\n";
     out << "  \"tcg_fix_force_value\": " << format_coeff(config.tcg_fix_force_value) << ",\n";
     out << "  \"tcg_incumbent_time_limit_sec\": " << config.tcg_incumbent_time_limit_sec << ",\n";
-    out << "  \"persistent_gurobi_master\": " << (persistent_master_used(logs) ? "true" : "false") << ",\n";
+    out << "  \"persistent_master\": " << (persistent_master_used(logs) ? "true" : "false") << ",\n";
+    out << "  \"persistent_gurobi_master\": " << (persistent_gurobi_master_used(logs) ? "true" : "false") << ",\n";
     out << "  \"dual_stabilization_enabled\": " << (config.enable_dual_stabilization ? "true" : "false") << ",\n";
     out << "  \"dual_stabilization_alpha\": " << format_coeff(config.dual_stabilization_alpha) << ",\n";
     out << "  \"dual_box_enabled\": " << (config.enable_dual_box ? "true" : "false") << ",\n";
@@ -4899,7 +5283,7 @@ void write_run_report(
         << " / " << format_coeff(config.tcg_fix_min_value)
         << " / " << format_coeff(config.tcg_fix_force_value) << "`\n";
     out << "- TCG incumbent time limit (s): `" << config.tcg_incumbent_time_limit_sec << "`\n";
-    out << "- Persistent Gurobi master: `" << (persistent_master_used(logs) ? "on" : "off") << "`\n";
+    out << "- Persistent master: `" << (persistent_master_used(logs) ? "on" : "off") << "`\n";
     out << "- Dual stabilization: `" << (config.enable_dual_stabilization ? "on" : "off") << "`\n";
     out << "- Dual stabilization alpha: `" << format_coeff(config.dual_stabilization_alpha) << "`\n";
     out << "- Adaptive pricing batch: `" << (config.enable_adaptive_pricing_batch ? "on" : "off") << "`\n";
@@ -4998,6 +5382,39 @@ bool python_has_gurobipy(const std::string& python_exe, bool debug) {
 #endif
 }
 
+bool python_has_coinmp(const std::string& python_exe, bool debug) {
+    const std::string python_cmd = python_exe.empty() ? "python" : python_exe;
+    const fs::path script_path = resolve_tool_script_path("solve_master_with_coinmp.py");
+    if (!fs::exists(script_path)) {
+        return false;
+    }
+#ifdef _WIN32
+    std::vector<std::wstring> argv_storage = {
+        fs::path(python_cmd).wstring(),
+        script_path.wstring(),
+        L"--self-check"
+    };
+    std::vector<const wchar_t*> argv;
+    argv.reserve(argv_storage.size() + 1);
+    for (const auto& arg : argv_storage) {
+        argv.push_back(arg.c_str());
+    }
+    argv.push_back(nullptr);
+    const intptr_t exit_code = _wspawnvp(_P_WAIT, argv_storage.front().c_str(), argv.data());
+    if (debug) {
+        std::cout << "[debug] coinmp probe exit=" << exit_code << "\n";
+    }
+    return exit_code == 0;
+#else
+    const std::string command = quote(python_cmd) + " " + quote(script_path.string()) + " --self-check >/dev/null 2>&1";
+    const int exit_code = std::system(command.c_str());
+    if (debug) {
+        std::cout << "[debug] coinmp probe exit=" << exit_code << "\n";
+    }
+    return exit_code == 0;
+#endif
+}
+
 bool bool_from_text(const std::string& value) {
     return value == "1" || value == "true" || value == "TRUE" || value == "True";
 }
@@ -5033,7 +5450,7 @@ void print_usage() {
         << "  --tcg-fix-min-value <v>     Base LP value threshold for fallback fixing candidates\n"
         << "  --tcg-fix-force-value <v>   Fix every feasible LP column with value at least this threshold\n"
         << "  --seed-phase <n>            Export legacy seed columns (0,4,5,6)\n"
-        << "  --persistent-master <0|1>   Keep iterative GUROBI LP master resident\n"
+        << "  --persistent-master <0|1>   Keep iterative in-memory LP master resident when supported\n"
         << "  --dual-stabilization <0|1>  Enable stabilized pricing duals\n"
         << "  --dual-alpha <v>            Convex weight on current duals\n"
         << "  --dual-box <0|1>            Enable box clipping around dual center\n"
@@ -5424,23 +5841,60 @@ int main(int argc, char* argv[]) {
         std::string best_integer_source;
         bool has_best_integer_result = false;
         const bool persistent_master_supported =
-            solver_name == "GUROBI" &&
             config.enable_persistent_gurobi_master &&
-            python_has_gurobipy(config.python_exe, config.debug);
+            (
+                (solver_name == "GUROBI" && python_has_gurobipy(config.python_exe, config.debug)) ||
+                (solver_name == "CBC" && python_has_coinmp(config.python_exe, config.debug))
+            );
         bool persistent_master_disabled = false;
-        std::optional<PersistentGurobiMasterSession> persistent_lp_session;
+        std::optional<PersistentGurobiMasterSession> persistent_gurobi_lp_session;
+        std::optional<PersistentCoinMPMasterSession> persistent_coinmp_lp_session;
+        auto reset_persistent_lp_session = [&]() {
+            if (persistent_gurobi_lp_session.has_value()) {
+                persistent_gurobi_lp_session.reset();
+            }
+            if (persistent_coinmp_lp_session.has_value()) {
+                persistent_coinmp_lp_session.reset();
+            }
+        };
         auto ensure_persistent_lp_session = [&]() {
             if (!persistent_master_supported ||
                 persistent_master_disabled ||
-                persistent_lp_session.has_value()) {
+                persistent_gurobi_lp_session.has_value() ||
+                persistent_coinmp_lp_session.has_value()) {
                 return;
             }
-            persistent_lp_session.emplace(
-                instance,
-                solution_dir / "_persistent_gurobi_master",
-                config.python_exe,
-                config.debug
-            );
+            if (solver_name == "GUROBI") {
+                persistent_gurobi_lp_session.emplace(
+                    instance,
+                    solution_dir / "_persistent_gurobi_master",
+                    config.python_exe,
+                    config.debug
+                );
+                return;
+            }
+            if (solver_name == "CBC") {
+                persistent_coinmp_lp_session.emplace(
+                    instance,
+                    solution_dir / "_persistent_coinmp_master",
+                    config.python_exe,
+                    config.debug
+                );
+            }
+        };
+        auto has_persistent_lp_session = [&]() {
+            return persistent_gurobi_lp_session.has_value() || persistent_coinmp_lp_session.has_value();
+        };
+        auto solve_with_persistent_lp_session = [&](const std::vector<Column>& solve_columns,
+                                                   const std::unordered_set<int>& solve_fixed_column_ids,
+                                                   int time_limit_sec) {
+            if (persistent_gurobi_lp_session.has_value()) {
+                return persistent_gurobi_lp_session->solve(solve_columns, solve_fixed_column_ids, time_limit_sec);
+            }
+            if (persistent_coinmp_lp_session.has_value()) {
+                return persistent_coinmp_lp_session->solve(solve_columns, solve_fixed_column_ids, time_limit_sec);
+            }
+            throw std::runtime_error("Persistent master session is not initialized");
         };
 
         ensure_persistent_lp_session();
@@ -5450,13 +5904,13 @@ int main(int argc, char* argv[]) {
             const auto iter_master_start = std::chrono::steady_clock::now();
             MasterSolveResult lp_result;
             ensure_persistent_lp_session();
-            if (persistent_lp_session.has_value()) {
+            if (has_persistent_lp_session()) {
                 try {
-                    lp_result = persistent_lp_session->solve(columns, fixed_column_ids, config.master_time_limit_sec);
+                    lp_result = solve_with_persistent_lp_session(columns, fixed_column_ids, config.master_time_limit_sec);
                 } catch (const std::exception& e) {
-                    std::cout << "[warn] Persistent Gurobi master failed (" << e.what()
+                    std::cout << "[warn] Persistent master failed (" << e.what()
                               << "), falling back to one-shot master solves\n";
-                    persistent_lp_session.reset();
+                    reset_persistent_lp_session();
                     persistent_master_disabled = true;
                     lp_result = solve_master(
                         instance,
@@ -5552,8 +6006,8 @@ int main(int argc, char* argv[]) {
                     for (const auto& column : columns) {
                         column_keys.insert(column.key);
                     }
-                    if (persistent_lp_session.has_value()) {
-                        persistent_lp_session.reset();
+                    if (has_persistent_lp_session()) {
+                        reset_persistent_lp_session();
                     }
                 }
             }
@@ -5701,8 +6155,8 @@ int main(int argc, char* argv[]) {
                 columns.push_back(std::move(column));
             }
         }
-        if (persistent_lp_session.has_value()) {
-            persistent_lp_session.reset();
+        if (has_persistent_lp_session()) {
+            reset_persistent_lp_session();
         }
 
         if (!root_pricing_exhausted) {
