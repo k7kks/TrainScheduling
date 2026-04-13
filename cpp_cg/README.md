@@ -149,10 +149,10 @@ Detailed implementation notes are in `docs/CG_CPP_IMPLEMENTATION_NOTES.md`.
 ## Solver status on this machine
 
 - Solver selection is explicit: `--solver CBC`, `--solver GUROBI`, or `--solver AUTO`.
-- `GUROBI` first tries the Python bridge in `tools/solve_master_with_gurobi.py` via `gurobipy`; if that fails, the C++ driver falls back to `CBC`.
+- `GUROBI` first tries the Python bridge in `tools/solve_master_with_gurobi.py` via `gurobipy`; that path now sends a structured master-model payload and builds the model directly in memory instead of writing an LP file for `gurobipy` to reread. If that fails, the C++ driver falls back to `CBC`.
 - `AUTO` now probes `gurobipy` first and otherwise falls back to `CBC`.
-- On this machine, `gurobipy` is available, but the current license is size-limited. Small smoke models solve with Gurobi; large `cs4` master LP/MIP files can still fail with `Model too large for size-limited license`, then fall back to `CBC`.
-- For large reproducible local runs, `--solver CBC` is still the practical choice unless an unrestricted Gurobi license is configured.
+- On this machine as of April 13, 2026, `gurobipy` is not installed, so the in-memory Python-Gurobi path is unavailable unless that dependency is added.
+- For current reproducible local runs on this machine, `--solver CBC` is still the practical default unless a usable in-memory Gurobi setup is configured.
 
 ## Current scope and limitations
 

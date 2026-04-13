@@ -295,10 +295,37 @@ struct DynamicRowPayload {
     std::vector<LinearRowTerm> terms;
 };
 
+struct StaticRowPayload {
+    std::string row_name;
+    std::string sense;
+    double rhs = 0.0;
+};
+
+struct ModelVariablePayload {
+    std::string var_name;
+    double obj = 0.0;
+    double lb = 0.0;
+    std::optional<double> ub;
+    char vtype = 'C';
+    std::vector<SparseRowCoeff> row_coeffs;
+};
+
 struct ActiveConflictRows {
     std::vector<int> option_conflict_ids;
     std::vector<int> arc_conflict_ids;
 };
+
+struct Instance;
+struct DepotGateStats;
+
+std::vector<DynamicRowPayload> build_incremental_depot_gate_rows(
+    const Instance& instance,
+    const std::vector<Column>& columns,
+    std::size_t start_index,
+    DepotGateStats* stats = nullptr
+);
+
+ActiveConflictRows collect_active_conflict_rows(const Instance& instance, const std::vector<Column>& columns);
 
 struct IterationLog {
     int iteration = 0;
@@ -1373,6 +1400,346 @@ std::vector<SparseRowCoeff> build_master_column_row_coeffs(const Instance& insta
     }
 
     return coeffs;
+}
+
+std::unordered_map<std::string, std::vector<SparseRowCoeff>> build_extra_row_coeffs_by_var(
+    const std::vector<DynamicRowPayload>& rows
+) {
+    std::unordered_map<std::string, std::vector<SparseRowCoeff>> coeffs_by_var;
+    for (const auto& row : rows) {
+        for (const auto& term : row.terms) {
+            coeffs_by_var[term.var_name].push_back({row.row_name, term.coeff});
+        }
+    }
+    return coeffs_by_var;
+}
+
+std::vector<StaticRowPayload> build_master_row_payloads(
+    const Instance& instance,
+    const std::vector<Column>& columns,
+    const ActiveConflictRows& active_conflict_rows
+) {
+    const auto depot_gate_rows = build_incremental_depot_gate_rows(instance, columns, 0, nullptr);
+    std::size_t row_capacity =
+        instance.peaks.size() +
+        (instance.max_vehicle_count > 0 ? 1 : 0) +
+        instance.slots.size() +
+        instance.headways.size() * 3 +
+        active_conflict_rows.option_conflict_ids.size() +
+        active_conflict_rows.arc_conflict_ids.size() +
+        instance.first_car_targets.size() +
+        depot_gate_rows.size();
+    for (const auto& peak : instance.peaks) {
+        if (peak.train_num1 > 0) {
+            ++row_capacity;
+        }
+        if (peak.train_num2 > 0) {
+            ++row_capacity;
+        }
+    }
+
+    std::vector<StaticRowPayload> rows;
+    rows.reserve(row_capacity);
+
+    for (const auto& peak : instance.peaks) {
+        rows.push_back({row_name_peak_cap(peak.id), "<=", static_cast<double>(peak.train_num)});
+    }
+
+    if (instance.max_vehicle_count > 0) {
+        rows.push_back({row_name_vehicle_cap(), "<=", static_cast<double>(instance.max_vehicle_count)});
+    }
+
+    for (const auto& slot : instance.slots) {
+        rows.push_back({row_name_cover(slot.id), "=", 1.0});
+    }
+
+    for (const auto& headway : instance.headways) {
+        rows.push_back({row_name_headway_lb(headway.id), ">=", static_cast<double>(headway.min_headway)});
+        rows.push_back({row_name_headway_ub(headway.id), "<=", static_cast<double>(headway.max_headway)});
+        rows.push_back({row_name_headway_target(headway.id), "=", static_cast<double>(headway.target_gap)});
+    }
+
+    for (const int conflict_id : active_conflict_rows.option_conflict_ids) {
+        rows.push_back({row_name_option_conflict(conflict_id), "<=", 1.0});
+    }
+
+    for (const int conflict_id : active_conflict_rows.arc_conflict_ids) {
+        rows.push_back({row_name_conflict(conflict_id), "<=", 1.0});
+    }
+
+    for (const auto& target : instance.first_car_targets) {
+        rows.push_back({row_name_first_car(target.id), ">=", 1.0});
+    }
+
+    for (const auto& row : depot_gate_rows) {
+        rows.push_back({row.row_name, row.sense, row.rhs});
+    }
+
+    for (const auto& peak : instance.peaks) {
+        if (peak.train_num1 > 0) {
+            rows.push_back({row_name_peak_cap_xr0(peak.id), "<=", static_cast<double>(peak.train_num1)});
+        }
+    }
+
+    for (const auto& peak : instance.peaks) {
+        if (peak.train_num2 > 0) {
+            rows.push_back({row_name_peak_cap_xr1(peak.id), "<=", static_cast<double>(peak.train_num2)});
+        }
+    }
+
+    return rows;
+}
+
+std::vector<ModelVariablePayload> build_master_variable_payloads(
+    const Instance& instance,
+    const std::vector<Column>& columns,
+    bool integer_master,
+    const std::unordered_set<int>& fixed_column_ids,
+    const ActiveConflictRows& active_conflict_rows
+) {
+    const auto depot_gate_rows = build_incremental_depot_gate_rows(instance, columns, 0, nullptr);
+    const auto extra_row_coeffs_by_var = build_extra_row_coeffs_by_var(depot_gate_rows);
+
+    std::size_t var_capacity =
+        columns.size() +
+        instance.peaks.size() +
+        instance.slots.size() * 2 +
+        instance.first_car_targets.size() +
+        instance.headways.size() * 2 +
+        active_conflict_rows.option_conflict_ids.size() +
+        active_conflict_rows.arc_conflict_ids.size() +
+        (instance.max_vehicle_count > 0 ? 1 : 0);
+    for (const auto& peak : instance.peaks) {
+        if (peak.train_num1 > 0) {
+            ++var_capacity;
+        }
+        if (peak.train_num2 > 0) {
+            ++var_capacity;
+        }
+    }
+
+    std::vector<ModelVariablePayload> vars;
+    vars.reserve(var_capacity);
+
+    for (const auto& column : columns) {
+        ModelVariablePayload payload;
+        payload.var_name = var_name_column(column.id);
+        payload.obj = column.cost;
+        payload.lb = fixed_column_ids.count(column.id) != 0 ? 1.0 : 0.0;
+        payload.ub = 1.0;
+        payload.vtype = integer_master ? 'B' : 'C';
+        payload.row_coeffs = build_master_column_row_coeffs(instance, column);
+        const auto extra_it = extra_row_coeffs_by_var.find(payload.var_name);
+        if (extra_it != extra_row_coeffs_by_var.end()) {
+            payload.row_coeffs.insert(
+                payload.row_coeffs.end(),
+                extra_it->second.begin(),
+                extra_it->second.end()
+            );
+        }
+        vars.push_back(std::move(payload));
+    }
+
+    for (const auto& peak : instance.peaks) {
+        vars.push_back({
+            var_name_slack_peak_cap(peak.id),
+            static_cast<double>(instance.peak_vehicle_penalty),
+            0.0,
+            std::nullopt,
+            'C',
+            {{row_name_peak_cap(peak.id), -1.0}}
+        });
+        if (peak.train_num1 > 0) {
+            vars.push_back({
+                var_name_slack_peak_xr0(peak.id),
+                static_cast<double>(instance.peak_vehicle_penalty),
+                0.0,
+                std::nullopt,
+                'C',
+                {{row_name_peak_cap_xr0(peak.id), -1.0}}
+            });
+        }
+        if (peak.train_num2 > 0) {
+            vars.push_back({
+                var_name_slack_peak_xr1(peak.id),
+                static_cast<double>(instance.peak_vehicle_penalty),
+                0.0,
+                std::nullopt,
+                'C',
+                {{row_name_peak_cap_xr1(peak.id), -1.0}}
+            });
+        }
+    }
+
+    if (instance.max_vehicle_count > 0) {
+        vars.push_back({
+            var_name_slack_vehicle_cap(),
+            static_cast<double>(instance.vehicle_cap_penalty),
+            0.0,
+            std::nullopt,
+            'C',
+            {{row_name_vehicle_cap(), -1.0}}
+        });
+    }
+
+    for (const auto& slot : instance.slots) {
+        vars.push_back({
+            var_name_slack_cover_miss(slot.id),
+            static_cast<double>(instance.cover_penalty),
+            0.0,
+            std::nullopt,
+            'C',
+            {{row_name_cover(slot.id), 1.0}}
+        });
+        vars.push_back({
+            var_name_slack_cover_extra(slot.id),
+            static_cast<double>(instance.cover_extra_penalty),
+            0.0,
+            std::nullopt,
+            'C',
+            {{row_name_cover(slot.id), -1.0}}
+        });
+    }
+
+    for (const auto& target : instance.first_car_targets) {
+        vars.push_back({
+            var_name_slack_first_car(target.id),
+            static_cast<double>(instance.cover_penalty),
+            0.0,
+            std::nullopt,
+            'C',
+            {{row_name_first_car(target.id), -1.0}}
+        });
+    }
+
+    for (const auto& headway : instance.headways) {
+        vars.push_back({
+            var_name_headway_dev_pos(headway.id),
+            static_cast<double>(instance.headway_target_penalty),
+            0.0,
+            std::nullopt,
+            'C',
+            {{row_name_headway_target(headway.id), -1.0}}
+        });
+        vars.push_back({
+            var_name_headway_dev_neg(headway.id),
+            static_cast<double>(instance.headway_target_penalty),
+            0.0,
+            std::nullopt,
+            'C',
+            {{row_name_headway_target(headway.id), 1.0}}
+        });
+    }
+
+    for (const int conflict_id : active_conflict_rows.option_conflict_ids) {
+        vars.push_back({
+            var_name_slack_option_conflict(conflict_id),
+            static_cast<double>(instance.conflict_penalty),
+            0.0,
+            std::nullopt,
+            'C',
+            {{row_name_option_conflict(conflict_id), -1.0}}
+        });
+    }
+
+    for (const int conflict_id : active_conflict_rows.arc_conflict_ids) {
+        vars.push_back({
+            var_name_slack_conflict(conflict_id),
+            static_cast<double>(instance.conflict_penalty),
+            0.0,
+            std::nullopt,
+            'C',
+            {{row_name_conflict(conflict_id), -1.0}}
+        });
+    }
+
+    return vars;
+}
+
+void append_master_row_payloads_json(std::ostringstream& out, const std::vector<StaticRowPayload>& rows) {
+    out << "[";
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+        if (index > 0) {
+            out << ",";
+        }
+        out << "{"
+            << "\"row_name\":\"" << json_escape(rows[index].row_name) << "\","
+            << "\"sense\":\"" << json_escape(rows[index].sense) << "\","
+            << "\"rhs\":" << format_coeff(rows[index].rhs)
+            << "}";
+    }
+    out << "]";
+}
+
+void append_master_variable_payloads_json(std::ostringstream& out, const std::vector<ModelVariablePayload>& vars) {
+    out << "[";
+    for (std::size_t index = 0; index < vars.size(); ++index) {
+        if (index > 0) {
+            out << ",";
+        }
+        out << "{"
+            << "\"var_name\":\"" << json_escape(vars[index].var_name) << "\","
+            << "\"obj\":" << format_coeff(vars[index].obj) << ","
+            << "\"lb\":" << format_coeff(vars[index].lb) << ","
+            << "\"ub\":";
+        if (vars[index].ub.has_value()) {
+            out << format_coeff(*vars[index].ub);
+        } else {
+            out << "null";
+        }
+        out << ",\"vtype\":\"" << vars[index].vtype << "\","
+            << "\"row_coeffs\":[";
+        for (std::size_t coeff_index = 0; coeff_index < vars[index].row_coeffs.size(); ++coeff_index) {
+            if (coeff_index > 0) {
+                out << ",";
+            }
+            out << "{"
+                << "\"row_name\":\"" << json_escape(vars[index].row_coeffs[coeff_index].row_name) << "\","
+                << "\"coeff\":" << format_coeff(vars[index].row_coeffs[coeff_index].coeff)
+                << "}";
+        }
+        out << "]"
+            << "}";
+    }
+    out << "]";
+}
+
+void append_master_model_json(
+    std::ostringstream& out,
+    const Instance& instance,
+    const std::vector<Column>& columns,
+    bool integer_master,
+    const std::unordered_set<int>& fixed_column_ids
+) {
+    const ActiveConflictRows active_conflict_rows = collect_active_conflict_rows(instance, columns);
+    const auto rows = build_master_row_payloads(instance, columns, active_conflict_rows);
+    const auto vars = build_master_variable_payloads(instance, columns, integer_master, fixed_column_ids, active_conflict_rows);
+
+    out << "\"model\":{"
+        << "\"sense\":\"min\","
+        << "\"rows\":";
+    append_master_row_payloads_json(out, rows);
+    out << ",\"variables\":";
+    append_master_variable_payloads_json(out, vars);
+    out << "}";
+}
+
+void write_master_model_json(
+    const Instance& instance,
+    const std::vector<Column>& columns,
+    bool integer_master,
+    const std::unordered_set<int>& fixed_column_ids,
+    const fs::path& json_path
+) {
+    std::ofstream out(json_path);
+    if (!out) {
+        throw std::runtime_error("Unable to open model JSON for writing: " + json_path.string());
+    }
+    std::ostringstream payload;
+    payload << "{";
+    append_master_model_json(payload, instance, columns, integer_master, fixed_column_ids);
+    payload << "}";
+    out << payload.str();
 }
 
 ActiveConflictRows collect_active_conflict_rows(const Instance& instance, const std::vector<Column>& columns) {
@@ -3121,14 +3488,13 @@ private:
         const std::unordered_set<int>& fixed_column_ids,
         int master_time_limit_sec
     ) {
-        const fs::path lp_path = session_dir_ / "master_init.lp";
-        write_master_lp(instance_, columns, false, fixed_column_ids, lp_path);
         std::ostringstream request;
         request << "{"
                 << "\"command\":\"init_solve\","
-                << "\"lp_path\":\"" << json_escape(lp_path.string()) << "\","
                 << "\"time_limit\":" << master_time_limit_sec << ","
-                << "\"log_to_console\":" << (debug_ ? 1 : 0)
+                << "\"log_to_console\":" << (debug_ ? 1 : 0) << ",";
+        append_master_model_json(request, instance_, columns, false, fixed_column_ids);
+        request
                 << "}";
         write_request_json(request.str());
         MasterSolveResult result = read_response_result();
@@ -3278,21 +3644,21 @@ MasterSolveResult solve_master_with_gurobi(
     bool debug
 ) {
     fs::create_directories(work_dir);
-    const fs::path lp_path = work_dir / (tag + ".lp");
     const fs::path json_sol_path = work_dir / (tag + "_sol.json");
+    const fs::path model_json_path = work_dir / (tag + "_model.json");
     std::error_code ec;
     fs::remove(json_sol_path, ec);
     fs::remove(work_dir / (tag + ".sol"), ec);
-    write_master_lp(instance, columns, integer_master, fixed_column_ids, lp_path);
 
     const fs::path script_path = resolve_tool_script_path("solve_master_with_gurobi.py");
     if (gurobi_path.empty() && fs::exists(script_path)) {
+        write_master_model_json(instance, columns, integer_master, fixed_column_ids, model_json_path);
 #ifdef _WIN32
         std::vector<std::wstring> argv_storage = {
             fs::path(python_exe.empty() ? "python" : python_exe).wstring(),
             script_path.wstring(),
-            L"--lp",
-            lp_path.wstring(),
+            L"--model-json",
+            model_json_path.wstring(),
             L"--out-json",
             json_sol_path.wstring(),
             L"--integer",
@@ -3321,7 +3687,7 @@ MasterSolveResult solve_master_with_gurobi(
 #else
         std::string command = quote(python_exe.empty() ? "python" : python_exe)
             + " " + quote(script_path.string())
-            + " --lp " + quote(lp_path.string())
+            + " --model-json " + quote(model_json_path.string())
             + " --out-json " + quote(json_sol_path.string())
             + " --integer " + std::to_string(integer_master ? 1 : 0)
             + " --time-limit " + std::to_string(master_time_limit_sec)
@@ -3347,6 +3713,8 @@ MasterSolveResult solve_master_with_gurobi(
     }
 
     if (!gurobi_path.empty()) {
+        const fs::path lp_path = work_dir / (tag + ".lp");
+        write_master_lp(instance, columns, integer_master, fixed_column_ids, lp_path);
 #ifdef _WIN32
         std::vector<std::string> argv_storage = {
             gurobi_path,
