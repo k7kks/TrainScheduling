@@ -164,7 +164,7 @@ def _compute_depot_routes(eng: Engineering, trips_by_dir) -> List[Dict[str, obje
     """Extract depot travel times for each xroad/direction combination.
 
     Returns rows with fields: xroad, direction, depot_in_time, depot_out_time,
-    depot_gate_gap.
+    depot_gate_gap, and the explicit depot in/out path metadata.
     - depot_out: time for vehicle to travel from depot to first mainline platform
       (inout=1 in DepotRoutesInfo)
     - depot_in:  time for vehicle to travel from last mainline platform back to depot
@@ -178,6 +178,12 @@ def _compute_depot_routes(eng: Engineering, trips_by_dir) -> List[Dict[str, obje
     dpis = getattr(eng.us, "depot_routes_infos", [])
     for xroad, dpi in enumerate(dpis):
         for direction in range(2):
+            in_route_ids: List[str] = []
+            if len(dpi.routes[0]) > direction:
+                in_route_ids = [str(route_id) for route_id in dpi.routes[0][direction] if str(route_id).strip()]
+            in_route_type = ""
+            if len(dpi.routeType[0]) > direction:
+                in_route_type = str(dpi.routeType[0][direction])
             # inout=0 -> depot-in segments
             in_segs: List[int] = []
             if len(dpi.routes_time[0]) > direction:
@@ -185,6 +191,12 @@ def _compute_depot_routes(eng: Engineering, trips_by_dir) -> List[Dict[str, obje
                     t for t in dpi.routes_time[0][direction]
                     if isinstance(t, (int, float)) and t > 0
                 ]
+            out_route_ids: List[str] = []
+            if len(dpi.routes[1]) > direction:
+                out_route_ids = [str(route_id) for route_id in dpi.routes[1][direction] if str(route_id).strip()]
+            out_route_type = ""
+            if len(dpi.routeType[1]) > direction:
+                out_route_type = str(dpi.routeType[1][direction])
             # inout=1 -> depot-out segments
             out_segs: List[int] = []
             if len(dpi.routes_time[1]) > direction:
@@ -200,6 +212,12 @@ def _compute_depot_routes(eng: Engineering, trips_by_dir) -> List[Dict[str, obje
                     "depot_in_time": int(sum(in_segs)),
                     "depot_out_time": int(sum(out_segs)),
                     "depot_gate_gap": gate_gap,
+                    "depot_in_route_id": int(in_route_ids[0]) if in_route_ids else 0,
+                    "depot_in_route_type": in_route_type,
+                    "depot_in_route_ids": ";".join(in_route_ids),
+                    "depot_out_route_id": int(out_route_ids[0]) if out_route_ids else 0,
+                    "depot_out_route_type": out_route_type,
+                    "depot_out_route_ids": ";".join(out_route_ids),
                 }
             )
     return rows
@@ -1056,7 +1074,19 @@ def build_instance(
         _write_csv(
             out_dir / "depot_routes.csv",
             depot_routes,
-            ["xroad", "direction", "depot_in_time", "depot_out_time", "depot_gate_gap"],
+            [
+                "xroad",
+                "direction",
+                "depot_in_time",
+                "depot_out_time",
+                "depot_gate_gap",
+                "depot_in_route_id",
+                "depot_in_route_type",
+                "depot_in_route_ids",
+                "depot_out_route_id",
+                "depot_out_route_type",
+                "depot_out_route_ids",
+            ],
         )
 
     if seed_rows:
