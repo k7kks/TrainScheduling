@@ -1685,6 +1685,32 @@ void append_master_row_payloads_json(std::ostringstream& out, const std::vector<
     out << "]";
 }
 
+void append_dynamic_row_payloads_json(std::ostringstream& out, const std::vector<DynamicRowPayload>& rows) {
+    out << "[";
+    for (std::size_t row_index = 0; row_index < rows.size(); ++row_index) {
+        if (row_index > 0) {
+            out << ",";
+        }
+        out << "{"
+            << "\"row_name\":\"" << json_escape(rows[row_index].row_name) << "\","
+            << "\"sense\":\"" << json_escape(rows[row_index].sense) << "\","
+            << "\"rhs\":" << format_coeff(rows[row_index].rhs) << ","
+            << "\"terms\":[";
+        for (std::size_t term_index = 0; term_index < rows[row_index].terms.size(); ++term_index) {
+            if (term_index > 0) {
+                out << ",";
+            }
+            out << "{"
+                << "\"var_name\":\"" << json_escape(rows[row_index].terms[term_index].var_name) << "\","
+                << "\"coeff\":" << format_coeff(rows[row_index].terms[term_index].coeff)
+                << "}";
+        }
+        out << "]"
+            << "}";
+    }
+    out << "]";
+}
+
 void append_master_variable_payloads_json(std::ostringstream& out, const std::vector<ModelVariablePayload>& vars) {
     out << "[";
     for (std::size_t index = 0; index < vars.size(); ++index) {
@@ -1787,6 +1813,152 @@ ActiveConflictRows collect_active_conflict_rows(const Instance& instance, const 
     std::sort(active_rows.option_conflict_ids.begin(), active_rows.option_conflict_ids.end());
     std::sort(active_rows.arc_conflict_ids.begin(), active_rows.arc_conflict_ids.end());
     return active_rows;
+}
+
+ActiveConflictRows diff_active_conflict_rows(
+    const ActiveConflictRows& current_rows,
+    const ActiveConflictRows& loaded_rows
+) {
+    ActiveConflictRows diff_rows;
+    std::set_difference(
+        current_rows.option_conflict_ids.begin(),
+        current_rows.option_conflict_ids.end(),
+        loaded_rows.option_conflict_ids.begin(),
+        loaded_rows.option_conflict_ids.end(),
+        std::back_inserter(diff_rows.option_conflict_ids)
+    );
+    std::set_difference(
+        current_rows.arc_conflict_ids.begin(),
+        current_rows.arc_conflict_ids.end(),
+        loaded_rows.arc_conflict_ids.begin(),
+        loaded_rows.arc_conflict_ids.end(),
+        std::back_inserter(diff_rows.arc_conflict_ids)
+    );
+    return diff_rows;
+}
+
+std::vector<DynamicRowPayload> build_incremental_conflict_rows(
+    const Instance& instance,
+    const std::vector<Column>& columns,
+    const ActiveConflictRows& added_conflict_rows
+) {
+    std::vector<DynamicRowPayload> rows;
+    rows.reserve(added_conflict_rows.option_conflict_ids.size() + added_conflict_rows.arc_conflict_ids.size());
+
+    for (const int conflict_id : added_conflict_rows.option_conflict_ids) {
+        const auto conflict_it = instance.option_conflict_by_id.find(conflict_id);
+        if (conflict_it == instance.option_conflict_by_id.end()) {
+            continue;
+        }
+        DynamicRowPayload row;
+        row.row_name = row_name_option_conflict(conflict_id);
+        row.sense = "<=";
+        row.rhs = 1.0;
+        for (const auto& column : columns) {
+            const int coeff = option_conflict_coefficient(column, conflict_it->second);
+            if (coeff == 0) {
+                continue;
+            }
+            row.terms.push_back({var_name_column(column.id), static_cast<double>(coeff)});
+        }
+        if (!row.terms.empty()) {
+            rows.push_back(std::move(row));
+        }
+    }
+
+    for (const int conflict_id : added_conflict_rows.arc_conflict_ids) {
+        const auto conflict_it = instance.conflict_by_id.find(conflict_id);
+        if (conflict_it == instance.conflict_by_id.end()) {
+            continue;
+        }
+        DynamicRowPayload row;
+        row.row_name = row_name_conflict(conflict_id);
+        row.sense = "<=";
+        row.rhs = 1.0;
+        for (const auto& column : columns) {
+            const int coeff = conflict_coefficient(column, conflict_it->second);
+            if (coeff == 0) {
+                continue;
+            }
+            row.terms.push_back({var_name_column(column.id), static_cast<double>(coeff)});
+        }
+        if (!row.terms.empty()) {
+            rows.push_back(std::move(row));
+        }
+    }
+
+    return rows;
+}
+
+std::vector<ModelVariablePayload> build_incremental_conflict_slack_variables(
+    const Instance& instance,
+    const ActiveConflictRows& added_conflict_rows
+) {
+    std::vector<ModelVariablePayload> vars;
+    vars.reserve(added_conflict_rows.option_conflict_ids.size() + added_conflict_rows.arc_conflict_ids.size());
+
+    for (const int conflict_id : added_conflict_rows.option_conflict_ids) {
+        vars.push_back({
+            var_name_slack_option_conflict(conflict_id),
+            static_cast<double>(instance.conflict_penalty),
+            0.0,
+            std::nullopt,
+            'C',
+            {{row_name_option_conflict(conflict_id), -1.0}}
+        });
+    }
+
+    for (const int conflict_id : added_conflict_rows.arc_conflict_ids) {
+        vars.push_back({
+            var_name_slack_conflict(conflict_id),
+            static_cast<double>(instance.conflict_penalty),
+            0.0,
+            std::nullopt,
+            'C',
+            {{row_name_conflict(conflict_id), -1.0}}
+        });
+    }
+
+    return vars;
+}
+
+std::unordered_set<std::string> build_conflict_row_name_set(const ActiveConflictRows& conflict_rows) {
+    std::unordered_set<std::string> row_names;
+    row_names.reserve(conflict_rows.option_conflict_ids.size() + conflict_rows.arc_conflict_ids.size());
+    for (const int conflict_id : conflict_rows.option_conflict_ids) {
+        row_names.insert(row_name_option_conflict(conflict_id));
+    }
+    for (const int conflict_id : conflict_rows.arc_conflict_ids) {
+        row_names.insert(row_name_conflict(conflict_id));
+    }
+    return row_names;
+}
+
+std::vector<SparseRowCoeff> filter_incremental_column_row_coeffs(
+    const std::vector<SparseRowCoeff>& row_coeffs,
+    const std::unordered_set<std::string>& excluded_row_names
+) {
+    if (excluded_row_names.empty()) {
+        return row_coeffs;
+    }
+    std::vector<SparseRowCoeff> filtered;
+    filtered.reserve(row_coeffs.size());
+    for (const auto& coeff : row_coeffs) {
+        if (excluded_row_names.count(coeff.row_name) != 0) {
+            continue;
+        }
+        filtered.push_back(coeff);
+    }
+    return filtered;
+}
+
+std::unordered_set<std::string> collect_dynamic_row_names(const std::vector<DynamicRowPayload>& rows) {
+    std::unordered_set<std::string> row_names;
+    row_names.reserve(rows.size());
+    for (const auto& row : rows) {
+        row_names.insert(row.row_name);
+    }
+    return row_names;
 }
 
 bool depot_out_gate_conflict(const Instance& instance, const Column& lhs, const Column& rhs) {
@@ -3465,6 +3637,8 @@ public:
         initialized_ = false;
         loaded_column_count_ = 0;
         loaded_fixed_column_ids_.clear();
+        loaded_active_conflict_rows_ = {};
+        loaded_depot_gate_row_names_.clear();
     }
 
 private:
@@ -3478,6 +3652,8 @@ private:
     bool initialized_ = false;
     std::size_t loaded_column_count_ = 0;
     std::unordered_set<int> loaded_fixed_column_ids_;
+    ActiveConflictRows loaded_active_conflict_rows_;
+    std::unordered_set<std::string> loaded_depot_gate_row_names_;
 
     void start_server() {
         if (started_) {
@@ -3541,6 +3717,8 @@ private:
         initialized_ = true;
         loaded_column_count_ = columns.size();
         loaded_fixed_column_ids_ = fixed_column_ids;
+        loaded_active_conflict_rows_ = collect_active_conflict_rows(instance_, columns);
+        loaded_depot_gate_row_names_ = collect_dynamic_row_names(build_incremental_depot_gate_rows(instance_, columns, 0));
         return result;
     }
 
@@ -3549,7 +3727,26 @@ private:
         const std::unordered_set<int>& fixed_column_ids,
         int master_time_limit_sec
     ) {
-        const auto new_rows = build_incremental_depot_gate_rows(instance_, columns, loaded_column_count_);
+        const ActiveConflictRows current_active_conflict_rows = collect_active_conflict_rows(instance_, columns);
+        const ActiveConflictRows added_conflict_rows =
+            diff_active_conflict_rows(current_active_conflict_rows, loaded_active_conflict_rows_);
+        const auto candidate_depot_rows = build_incremental_depot_gate_rows(instance_, columns, loaded_column_count_);
+        std::vector<DynamicRowPayload> new_rows;
+        std::vector<DynamicRowPayload> existing_depot_rows;
+        new_rows.reserve(candidate_depot_rows.size());
+        existing_depot_rows.reserve(candidate_depot_rows.size());
+        for (const auto& row : candidate_depot_rows) {
+            if (loaded_depot_gate_row_names_.count(row.row_name) != 0) {
+                existing_depot_rows.push_back(row);
+            } else {
+                new_rows.push_back(row);
+            }
+        }
+        const auto new_conflict_rows = build_incremental_conflict_rows(instance_, columns, added_conflict_rows);
+        new_rows.insert(new_rows.end(), new_conflict_rows.begin(), new_conflict_rows.end());
+        const auto new_variables = build_incremental_conflict_slack_variables(instance_, added_conflict_rows);
+        const auto excluded_row_names = build_conflict_row_name_set(added_conflict_rows);
+        const auto existing_depot_row_coeffs_by_var = build_extra_row_coeffs_by_var(existing_depot_rows);
         std::ostringstream request;
         request << "{"
                 << "\"command\":\"add_columns_and_solve\","
@@ -3561,18 +3758,30 @@ private:
                 request << ",";
             }
             const auto& column = columns[index];
-            const auto row_coeffs = build_master_column_row_coeffs(instance_, column);
+            const auto row_coeffs = filter_incremental_column_row_coeffs(
+                build_master_column_row_coeffs(instance_, column),
+                excluded_row_names
+            );
+            auto augmented_row_coeffs = row_coeffs;
+            const auto extra_it = existing_depot_row_coeffs_by_var.find(var_name_column(column.id));
+            if (extra_it != existing_depot_row_coeffs_by_var.end()) {
+                augmented_row_coeffs.insert(
+                    augmented_row_coeffs.end(),
+                    extra_it->second.begin(),
+                    extra_it->second.end()
+                );
+            }
             request << "{"
                     << "\"var_name\":\"" << json_escape(var_name_column(column.id)) << "\","
                     << "\"cost\":" << format_coeff(column.cost) << ","
                     << "\"row_coeffs\":[";
-            for (std::size_t coeff_index = 0; coeff_index < row_coeffs.size(); ++coeff_index) {
+            for (std::size_t coeff_index = 0; coeff_index < augmented_row_coeffs.size(); ++coeff_index) {
                 if (coeff_index > 0) {
                     request << ",";
                 }
                 request << "{"
-                        << "\"row_name\":\"" << json_escape(row_coeffs[coeff_index].row_name) << "\","
-                        << "\"coeff\":" << format_coeff(row_coeffs[coeff_index].coeff)
+                        << "\"row_name\":\"" << json_escape(augmented_row_coeffs[coeff_index].row_name) << "\","
+                        << "\"coeff\":" << format_coeff(augmented_row_coeffs[coeff_index].coeff)
                         << "}";
             }
             request << "]"
@@ -3596,29 +3805,11 @@ private:
                     << "}";
         }
         request << "],"
-                << "\"new_rows\":[";
-        for (std::size_t row_index = 0; row_index < new_rows.size(); ++row_index) {
-            if (row_index > 0) {
-                request << ",";
-            }
-            request << "{"
-                    << "\"row_name\":\"" << json_escape(new_rows[row_index].row_name) << "\","
-                    << "\"sense\":\"" << json_escape(new_rows[row_index].sense) << "\","
-                    << "\"rhs\":" << format_coeff(new_rows[row_index].rhs) << ","
-                    << "\"terms\":[";
-            for (std::size_t term_index = 0; term_index < new_rows[row_index].terms.size(); ++term_index) {
-                if (term_index > 0) {
-                    request << ",";
-                }
-                request << "{"
-                        << "\"var_name\":\"" << json_escape(new_rows[row_index].terms[term_index].var_name) << "\","
-                        << "\"coeff\":" << format_coeff(new_rows[row_index].terms[term_index].coeff)
-                        << "}";
-            }
-            request << "]"
-                    << "}";
-        }
-        request << "]"
+                << "\"new_rows\":";
+        append_dynamic_row_payloads_json(request, new_rows);
+        request << ",\"new_variables\":";
+        append_master_variable_payloads_json(request, new_variables);
+        request
                 << "}";
         write_request_json(request.str());
         MasterSolveResult result = read_response_result();
@@ -3626,6 +3817,10 @@ private:
         result.actual_solver = "GUROBI_PERSISTENT";
         loaded_column_count_ = columns.size();
         loaded_fixed_column_ids_ = fixed_column_ids;
+        loaded_active_conflict_rows_ = current_active_conflict_rows;
+        for (const auto& row : candidate_depot_rows) {
+            loaded_depot_gate_row_names_.insert(row.row_name);
+        }
         return result;
     }
 
@@ -3718,6 +3913,8 @@ public:
         initialized_ = false;
         loaded_column_count_ = 0;
         loaded_fixed_column_ids_.clear();
+        loaded_active_conflict_rows_ = {};
+        loaded_depot_gate_row_names_.clear();
     }
 
 private:
@@ -3731,6 +3928,8 @@ private:
     bool initialized_ = false;
     std::size_t loaded_column_count_ = 0;
     std::unordered_set<int> loaded_fixed_column_ids_;
+    ActiveConflictRows loaded_active_conflict_rows_;
+    std::unordered_set<std::string> loaded_depot_gate_row_names_;
 
     void start_server() {
         if (started_) {
@@ -3793,6 +3992,8 @@ private:
         initialized_ = true;
         loaded_column_count_ = columns.size();
         loaded_fixed_column_ids_ = fixed_column_ids;
+        loaded_active_conflict_rows_ = collect_active_conflict_rows(instance_, columns);
+        loaded_depot_gate_row_names_ = collect_dynamic_row_names(build_incremental_depot_gate_rows(instance_, columns, 0));
         return result;
     }
 
@@ -3801,7 +4002,26 @@ private:
         const std::unordered_set<int>& fixed_column_ids,
         int master_time_limit_sec
     ) {
-        const auto new_rows = build_incremental_depot_gate_rows(instance_, columns, loaded_column_count_);
+        const ActiveConflictRows current_active_conflict_rows = collect_active_conflict_rows(instance_, columns);
+        const ActiveConflictRows added_conflict_rows =
+            diff_active_conflict_rows(current_active_conflict_rows, loaded_active_conflict_rows_);
+        const auto candidate_depot_rows = build_incremental_depot_gate_rows(instance_, columns, loaded_column_count_);
+        std::vector<DynamicRowPayload> new_rows;
+        std::vector<DynamicRowPayload> existing_depot_rows;
+        new_rows.reserve(candidate_depot_rows.size());
+        existing_depot_rows.reserve(candidate_depot_rows.size());
+        for (const auto& row : candidate_depot_rows) {
+            if (loaded_depot_gate_row_names_.count(row.row_name) != 0) {
+                existing_depot_rows.push_back(row);
+            } else {
+                new_rows.push_back(row);
+            }
+        }
+        const auto new_conflict_rows = build_incremental_conflict_rows(instance_, columns, added_conflict_rows);
+        new_rows.insert(new_rows.end(), new_conflict_rows.begin(), new_conflict_rows.end());
+        const auto new_variables = build_incremental_conflict_slack_variables(instance_, added_conflict_rows);
+        const auto excluded_row_names = build_conflict_row_name_set(added_conflict_rows);
+        const auto existing_depot_row_coeffs_by_var = build_extra_row_coeffs_by_var(existing_depot_rows);
         std::ostringstream request;
         request << "{"
                 << "\"command\":\"add_columns_and_solve\","
@@ -3813,7 +4033,19 @@ private:
                 request << ",";
             }
             const auto& column = columns[index];
-            const auto row_coeffs = build_master_column_row_coeffs(instance_, column);
+            const auto row_coeffs = filter_incremental_column_row_coeffs(
+                build_master_column_row_coeffs(instance_, column),
+                excluded_row_names
+            );
+            auto augmented_row_coeffs = row_coeffs;
+            const auto extra_it = existing_depot_row_coeffs_by_var.find(var_name_column(column.id));
+            if (extra_it != existing_depot_row_coeffs_by_var.end()) {
+                augmented_row_coeffs.insert(
+                    augmented_row_coeffs.end(),
+                    extra_it->second.begin(),
+                    extra_it->second.end()
+                );
+            }
             request << "{"
                     << "\"var_name\":\"" << json_escape(var_name_column(column.id)) << "\","
                     << "\"cost\":" << format_coeff(column.cost) << ","
@@ -3821,13 +4053,13 @@ private:
                     << "\"ub\":1.0,"
                     << "\"vtype\":\"C\","
                     << "\"row_coeffs\":[";
-            for (std::size_t coeff_index = 0; coeff_index < row_coeffs.size(); ++coeff_index) {
+            for (std::size_t coeff_index = 0; coeff_index < augmented_row_coeffs.size(); ++coeff_index) {
                 if (coeff_index > 0) {
                     request << ",";
                 }
                 request << "{"
-                        << "\"row_name\":\"" << json_escape(row_coeffs[coeff_index].row_name) << "\","
-                        << "\"coeff\":" << format_coeff(row_coeffs[coeff_index].coeff)
+                        << "\"row_name\":\"" << json_escape(augmented_row_coeffs[coeff_index].row_name) << "\","
+                        << "\"coeff\":" << format_coeff(augmented_row_coeffs[coeff_index].coeff)
                         << "}";
             }
             request << "]"
@@ -3851,29 +4083,11 @@ private:
                     << "}";
         }
         request << "],"
-                << "\"new_rows\":[";
-        for (std::size_t row_index = 0; row_index < new_rows.size(); ++row_index) {
-            if (row_index > 0) {
-                request << ",";
-            }
-            request << "{"
-                    << "\"row_name\":\"" << json_escape(new_rows[row_index].row_name) << "\","
-                    << "\"sense\":\"" << json_escape(new_rows[row_index].sense) << "\","
-                    << "\"rhs\":" << format_coeff(new_rows[row_index].rhs) << ","
-                    << "\"terms\":[";
-            for (std::size_t term_index = 0; term_index < new_rows[row_index].terms.size(); ++term_index) {
-                if (term_index > 0) {
-                    request << ",";
-                }
-                request << "{"
-                        << "\"var_name\":\"" << json_escape(new_rows[row_index].terms[term_index].var_name) << "\","
-                        << "\"coeff\":" << format_coeff(new_rows[row_index].terms[term_index].coeff)
-                        << "}";
-            }
-            request << "]"
-                    << "}";
-        }
-        request << "]"
+                << "\"new_rows\":";
+        append_dynamic_row_payloads_json(request, new_rows);
+        request << ",\"new_variables\":";
+        append_master_variable_payloads_json(request, new_variables);
+        request
                 << "}";
         write_request_json(request.str());
         MasterSolveResult result = read_response_result();
@@ -3881,6 +4095,10 @@ private:
         result.actual_solver = "CBC_PERSISTENT";
         loaded_column_count_ = columns.size();
         loaded_fixed_column_ids_ = fixed_column_ids;
+        loaded_active_conflict_rows_ = current_active_conflict_rows;
+        for (const auto& row : candidate_depot_rows) {
+            loaded_depot_gate_row_names_.insert(row.row_name);
+        }
         return result;
     }
 

@@ -197,6 +197,33 @@ class PersistentMasterSession:
 
         self.model.update()
         self._refresh_handles()
+
+        for variable in request.get("new_variables", []):
+            coeffs = []
+            constrs = []
+            for term in variable.get("row_coeffs", []):
+                row_name = term["row_name"]
+                constr = self.constrs_by_name.get(row_name)
+                if constr is None:
+                    raise KeyError(f"Unknown constraint {row_name} while adding variable {variable['var_name']}")
+                coeffs.append(float(term["coeff"]))
+                constrs.append(constr)
+            ub_value = variable.get("ub", None)
+            ub = gp.GRB.INFINITY if ub_value is None else float(ub_value)
+            vtype = gp.GRB.BINARY if variable.get("vtype", "C") == "B" else gp.GRB.CONTINUOUS
+            gp_column = gp.Column(coeffs, constrs)
+            var = self.model.addVar(
+                lb=float(variable.get("lb", 0.0)),
+                ub=ub,
+                obj=float(variable.get("obj", 0.0)),
+                vtype=vtype,
+                name=variable["var_name"],
+                column=gp_column,
+            )
+            self.vars_by_name[variable["var_name"]] = var
+
+        self.model.update()
+        self._refresh_handles()
         self.model.optimize()
         self._refresh_handles()
         return build_output(self.model, include_duals=True)

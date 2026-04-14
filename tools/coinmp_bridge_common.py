@@ -362,6 +362,20 @@ def add_incremental_payload(
         for term in row.get("terms", []):
             constraints_by_name[row["row_name"]].addInPlace(vars_by_name[term["var_name"]] * float(term["coeff"]))
 
+    for variable in request.get("new_variables", []):
+        upper_bound = variable.get("ub")
+        category = pulp.LpBinary if variable.get("vtype", "C") == "B" else pulp.LpContinuous
+        var = pulp.LpVariable(
+            variable["var_name"],
+            lowBound=float(variable.get("lb", 0.0)),
+            upBound=None if upper_bound is None else float(upper_bound),
+            cat=category,
+        )
+        vars_by_name[variable["var_name"]] = var
+        objective += float(variable.get("obj", 0.0)) * var
+        for row_coeff in variable.get("row_coeffs", []):
+            constraints_by_name[row_coeff["row_name"]].addInPlace(var * float(row_coeff["coeff"]))
+
     problem.setObjective(objective)
 
 
